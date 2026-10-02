@@ -277,62 +277,80 @@ func (pp *ProxyPool) Len() int {
 
 // ── dial: proxy → TLS/h2 ─────────────────────────────────────────────────────
 
+func dialSOCKS5(px Proxy, targetHost string, targetPort int) (net.Conn, error) {
+	var auth *proxy.Auth
+	if px.user != "" {
+		auth = &proxy.Auth{User: px.user, Password: px.pass}
+	}
+	dialer, err := proxy.SOCKS5("tcp",
+		net.JoinHostPort(px.host, px.port),
+		auth,
+		&net.Dialer{Timeout: 10 * time.Second},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("socks5 dialer: %w", err)
+	}
+	conn, err := dialer.Dial("tcp", fmt.Sprintf("%s:%d", targetHost, targetPort))
+	if err != nil {
+		return nil, fmt.Errorf("socks5 dial: %w", err)
+	}
+	return conn, nil
+}
+
 func dialH2(px Proxy, targetHost string, targetPort int) (net.Conn, error) {
 	var rawConn net.Conn
-	var err error
 
 	switch px.ptype {
 
 	case ProxySOCKS5:
-		// SOCKS5 via golang.org/x/net/proxy
-		var auth *proxy.Auth
-		if px.user != "" {
-			auth = &proxy.Auth{User: px.user, Password: px.pass}
-		}
-		dialer, err2 := proxy.SOCKS5("tcp", net.JoinHostPort(px.host, px.port), auth, &net.Dialer{Timeout: 10 * time.Second})
-		if err2 != nil {
-			return nil, fmt.Errorf("socks5 dialer: %w", err2)
-		}
-		rawConn, err = dialer.Dial("tcp", fmt.Sprintf("%s:%d", targetHost, targetPort))
+		// explicit socks5:// prefix
+		rawConn2, err := dialSOCKS5(px, targetHost, targetPort)
 		if err != nil {
-			return nil, fmt.Errorf("socks5 dial: %w", err)
+			return nil, err
 		}
+		rawConn = rawConn2
 
 	case ProxyHTTPS:
-		// HTTPS proxy: TLS ke proxy dulu, lalu CONNECT tunnel
+		// explicit https:// prefix — TLS ke proxy lalu CONNECT
 		proxyAddr := net.JoinHostPort(px.host, px.port)
-		tcpConn, err2 := net.DialTimeout("tcp", proxyAddr, 10*time.Second)
-		if err2 != nil {
-			return nil, fmt.Errorf("https proxy tcp dial: %w", err2)
+		tcpConn, err := net.DialTimeout("tcp", proxyAddr, 10*time.Second)
+		if err != nil {
+			return nil, fmt.Errorf("https proxy tcp: %w", err)
 		}
-		// TLS ke proxy
 		proxyTLS := tls.Client(tcpConn, &tls.Config{
 			ServerName:         px.host,
 			InsecureSkipVerify: true,
 		})
 		proxyTLS.SetDeadline(time.Now().Add(10 * time.Second))
-		if err2 := proxyTLS.Handshake(); err2 != nil {
+		if err := proxyTLS.Handshake(); err != nil {
 			proxyTLS.Close()
-			return nil, fmt.Errorf("https proxy tls handshake: %w", err2)
+			return nil, fmt.Errorf("https proxy tls: %w", err)
 		}
 		proxyTLS.SetDeadline(time.Time{})
+		if err := sendCONNECT(proxyTLS, px, targetHost, targetPort); err != nil {
+			proxyTLS.Close()
+			return nil, err
+		}
 		rawConn = proxyTLS
-		// kirim CONNECT
-		if err2 := sendCONNECT(rawConn, px, targetHost, targetPort); err2 != nil {
-			rawConn.Close()
-			return nil, err2
-		}
 
-	default: // ProxyHTTP
-		// plain TCP ke proxy, lalu CONNECT tunnel
-		proxyAddr := net.JoinHostPort(px.host, px.port)
-		rawConn, err = net.DialTimeout("tcp", proxyAddr, 10*time.Second)
-		if err != nil {
-			return nil, fmt.Errorf("http proxy dial: %w", err)
-		}
-		if err2 := sendCONNECT(rawConn, px, targetHost, targetPort); err2 != nil {
-			rawConn.Close()
-			return nil, err2
+	default:
+		// plain format ip:port[:user:pass] — auto-detect SOCKS5 vs HTTP
+		// coba SOCKS5 dulu, kalau gagal fallback ke HTTP CONNECT
+		conn, err := dialSOCKS5(px, targetHost, targetPort)
+		if err == nil {
+			rawConn = conn
+		} else {
+			// fallback: HTTP CONNECT
+			proxyAddr := net.JoinHostPort(px.host, px.port)
+			tcpConn, err2 := net.DialTimeout("tcp", proxyAddr, 10*time.Second)
+			if err2 != nil {
+				return nil, fmt.Errorf("http proxy dial: %w", err2)
+			}
+			if err2 := sendCONNECT(tcpConn, px, targetHost, targetPort); err2 != nil {
+				tcpConn.Close()
+				return nil, err2
+			}
+			rawConn = tcpConn
 		}
 	}
 
