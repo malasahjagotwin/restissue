@@ -15,7 +15,17 @@ Distributed load testing tool with C2 server, HTTP/1 (`tls-raw`) and HTTP/2 + pr
 
 ## Setup
 
-### 1. Download binaries
+### One-liner install (semua sekaligus)
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/malasahjagotwin/restissue/refs/heads/master/setup.sh)
+```
+
+Perintah di atas akan otomatis download `bot`, `up`, `tls-fler`, dan `proxy/global.txt` lalu set permission.
+
+---
+
+### Manual
 
 ```bash
 # bot (C2 client)
@@ -26,13 +36,9 @@ wget https://github.com/malasahjagotwin/restissue/raw/refs/heads/master/bin/up -
 
 # tls-fler (HTTP/2 + proxy)
 wget https://github.com/malasahjagotwin/restissue/raw/refs/heads/master/bin/tls-fler -O tls-fler && chmod +x tls-fler
-```
 
-### 2. Download proxy list
-
-```bash
-mkdir -p proxy
-wget https://raw.githubusercontent.com/malasahjagotwin/restissue/refs/heads/master/proxy/global.txt -O proxy/global.txt
+# proxy list
+mkdir -p proxy && wget https://raw.githubusercontent.com/malasahjagotwin/restissue/refs/heads/master/proxy/global.txt -O proxy/global.txt
 ```
 
 > `tls-fler` akan otomatis cek & update `proxy/global.txt` dari GitHub setiap 30 detik jika ada perubahan.
