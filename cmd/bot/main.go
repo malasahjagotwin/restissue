@@ -1,3 +1,4 @@
+// bot client — maintained by malasahjagobob
 package main
 
 import (
