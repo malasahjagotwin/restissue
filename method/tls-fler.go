@@ -251,6 +251,15 @@ func randomMejiQuery() string {
 	return strings.Join(pairs, "&")
 }
 
+// resolveURL mengganti semua %RAND% di URL dengan random string (8-16 char)
+// Contoh: https://google.com/%RAND% → https://google.com/a3x9kzmq
+func resolveURL(rawURL string) string {
+	for strings.Contains(rawURL, "%RAND%") {
+		rawURL = strings.Replace(rawURL, "%RAND%", randStr(rand.Intn(9)+8), 1)
+	}
+	return rawURL
+}
+
 func appendMejiQuery(rawURL string) string {
 	q := randomMejiQuery()
 	if strings.Contains(rawURL, "?") {
@@ -298,7 +307,7 @@ func makeRequest(pool *proxyPool, target string, isMobile bool) bool {
 	p := pool.random()
 	client := buildH2Client(p)
 
-	req, err := http.NewRequest("GET", appendMejiQuery(target), nil)
+	req, err := http.NewRequest("GET", appendMejiQuery(resolveURL(target)), nil)
 	if err != nil {
 		return false
 	}
